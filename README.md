@@ -1,6 +1,6 @@
 # SomaFM Radio
 
-A [SomaFM](https://somafm.com) radio player for the **TrimUI Hammer** running [NextUI](https://github.com/LoveRetro/NextUI), built with the [Apostrophe](https://github.com/Helaas/apostrophe) UI toolkit.
+A [SomaFM](https://somafm.com) radio player for the **TrimUI Brick/Hammer** running [NextUI](https://github.com/LoveRetro/NextUI), built with the [Apostrophe](https://github.com/Helaas/apostrophe) UI toolkit.
 
 Browse and play SomaFM internet radio stations, save favorites, and keep music playing in the background while you game.
 
