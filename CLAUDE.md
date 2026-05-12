@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 make tg5040        # cross-compile for TrimUI Hammer → build/tg5040/SomaFM Radio.pak/
+make linux         # native desktop build for quick iteration (requires SDL2, SDL2_ttf, SDL2_image, libcurl)
 make clean         # remove build/
 ```
 
-Docker (`ghcr.io/loveretro/tg5040-toolchain:latest`) is required. On Flatpak-based systems the Makefile falls back to `flatpak-spawn --host docker` automatically.
+Docker (`ghcr.io/loveretro/tg5040-toolchain:latest`) is required for `tg5040`. On Flatpak-based systems the Makefile falls back to `flatpak-spawn --host docker` automatically.
 
 First build downloads and cross-compiles curl/openssl (via `apostrophe/scripts/build_third_party.sh`) and mpg123 (via `scripts/build_mpg123.sh`) — this takes several minutes. Subsequent builds are fast because stamp files cache the results.
 
@@ -42,8 +43,10 @@ When the user exits via **B** in the main menu while music is playing, the app d
 ### Cover art
 Downloaded synchronously via libcurl to `/tmp/soma_cover.png` when a station starts playing. Cached as `g_cover_tex` (SDL_Texture). Uses the `image` field (~120 px) from the SomaFM API, not `largeimage`.
 
-### Screen timeout (`screen_now_playing` only)
-Implemented as a custom render loop with `SCREEN_ON`/`SCREEN_OFF`/`SCREEN_HINT` states. `backlight_off()`/`backlight_on()` use `/dev/disp` ioctl + `/SharedSettings` POSIX SHM (identical to nexttimer). Wake: **SELECT + A**.
+### Screen sleep / timeout
+Both `screen_now_playing` and `screen_main_menu` support screen-off via **SELECT** (immediate sleep). In `screen_now_playing` the timer also fires after the configured timeout. Implemented with `SCREEN_ON`/`SCREEN_OFF`/`SCREEN_HINT` states in `screen_now_playing` and a simple `scr_off` flag in `screen_main_menu`. `backlight_off()`/`backlight_on()` use `/dev/disp` ioctl + `/SharedSettings` POSIX SHM (identical to nexttimer). Wake in Now Playing: **SELECT + A**; in Main Menu: any button.
+
+`ap_list`/`ap_options_list` screens (Stations, Favorites, Settings) are blocking widgets — SELECT cannot be intercepted there without modifying the toolkit.
 
 ### apostrophe UI toolkit
 Header-only (`apostrophe.h` + `apostrophe_widgets.h`). Exactly one `.c` file must define `AP_IMPLEMENTATION` and `AP_WIDGETS_IMPLEMENTATION` before including. Blocking widgets: `ap_list`, `ap_options_list`, `ap_detail_screen`, `ap_confirmation`. Custom loops use `ap_poll_input()` + `ap_draw_*()` + `ap_present()`.
