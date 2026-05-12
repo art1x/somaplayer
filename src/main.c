@@ -572,7 +572,7 @@ static void screen_now_playing(int idx) {
                 if (ev.button == AP_BTN_A && select_held) {
                     scr       = SCREEN_ON;
                     last_input = SDL_GetTicks();
-                    ap_set_power_handler(true);
+
 #ifdef PLATFORM_TG5040
                     backlight_on();
 #endif
@@ -590,7 +590,7 @@ static void screen_now_playing(int idx) {
 
             if (ev.button == AP_BTN_SELECT) {
                 scr = SCREEN_OFF;
-                ap_set_power_handler(false);
+
 #ifdef PLATFORM_TG5040
                 backlight_off();
 #endif
@@ -623,12 +623,10 @@ static void screen_now_playing(int idx) {
         }
 
         if (was_on && scr != SCREEN_ON) {
-            ap_set_power_handler(false);
 #ifdef PLATFORM_TG5040
             backlight_off();
 #endif
         } else if (!was_on && scr == SCREEN_ON) {
-            ap_set_power_handler(true);
 #ifdef PLATFORM_TG5040
             backlight_on();
 #endif
@@ -889,7 +887,7 @@ static void screen_main_menu(void) {
 
             if (ev.button == AP_BTN_SELECT) {
                 scr_off = 1;
-                ap_set_power_handler(false);
+
 #ifdef PLATFORM_TG5040
                 backlight_off();
 #endif
@@ -898,7 +896,6 @@ static void screen_main_menu(void) {
 
             if (scr_off) {
                 scr_off = 0;
-                ap_set_power_handler(true);
 #ifdef PLATFORM_TG5040
                 backlight_on();
 #endif
@@ -959,6 +956,7 @@ int main(void) {
         .cpu_speed    = AP_CPU_SPEED_NORMAL,
     };
     if (ap_init(&cfg) != AP_OK) return 1;
+    ap_set_power_handler(false);
 
     soma_init();
     player_init();
