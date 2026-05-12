@@ -16,6 +16,11 @@ OPENSSL_LIBSSL    := $(OPENSSL_PREFIX)/lib/libssl.a
 OPENSSL_LIBCRYPTO := $(OPENSSL_PREFIX)/lib/libcrypto.a
 CURL_STAMP  := $(CURL_PREFIX)/.stamp-curl-8.7.1-static2
 
+MPG123_SCRIPT  := /workspace/scripts/build_mpg123.sh
+MPG123_PREFIX  := /workspace/build/third_party/$(PLATFORM_ID)/mpg123
+MPG123_BIN     := $(MPG123_PREFIX)/bin/mpg123
+MPG123_STAMP   := $(MPG123_PREFIX)/.stamp-mpg123-1.32.9
+
 CURL_CFLAGS  := -I$(CURL_PREFIX)/include -DAP_ENABLE_CURL -ffunction-sections -fdata-sections
 CURL_LDFLAGS := \
 	-Wl,--whole-archive $(CURL_PREFIX)/lib/libcurl.a -Wl,--no-whole-archive \
@@ -29,14 +34,20 @@ CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
 	-I/workspace/src \
 	$(SDL_CFLAGS) $(CURL_CFLAGS)
 
-LDFLAGS := $(SDL_LDFLAGS) $(CURL_LDFLAGS) -lpthread -ldl -lm
+LDFLAGS := $(SDL_LDFLAGS) $(CURL_LDFLAGS) -lpthread -ldl -lm -lrt
 
 .PHONY: all clean
 
-all: $(BUILD_DIR)/somaplayer
+all: $(BUILD_DIR)/somaplayer $(BUILD_DIR)/mpg123
 
 $(CURL_STAMP): /workspace/apostrophe/scripts/build_third_party.sh
 	$(THIRD_PARTY_SCRIPT) ensure-curl $(PLATFORM_ID)
+
+$(MPG123_STAMP): $(MPG123_SCRIPT)
+	$(MPG123_SCRIPT)
+
+$(BUILD_DIR)/mpg123: $(MPG123_STAMP)
+	cp $(MPG123_BIN) $@
 
 $(BUILD_DIR)/somaplayer: $(SRCS) $(CURL_STAMP)
 	@mkdir -p $(BUILD_DIR)

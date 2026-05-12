@@ -112,6 +112,7 @@ int soma_fetch_channels(SomaChannelList *out) {
         cJSON *jgenre  = cJSON_GetObjectItem(ch, "genre");
         cJSON *jid     = cJSON_GetObjectItem(ch, "id");
         cJSON *jlist   = cJSON_GetObjectItem(ch, "listeners");
+        cJSON *jimg    = cJSON_GetObjectItem(ch, "image");
 
         if (!jtitle || !cJSON_IsString(jtitle)) continue;
 
@@ -124,22 +125,30 @@ int soma_fetch_channels(SomaChannelList *out) {
             safe_copy(c->id,          jid->valuestring,     SOMA_ID_LEN);
         if (jlist  && cJSON_IsNumber(jlist))
             c->listeners = (int)jlist->valuedouble;
+        if (jimg   && cJSON_IsString(jimg))
+            safe_copy(c->image_url, jimg->valuestring, SOMA_URL_LEN);
 
-        /* 1. Try streams[] array – prefer mp3 format */
+        /* 1. Try streams[] array – prefer http:// mp3 first, https:// mp3 as fallback */
         cJSON *jstreams = cJSON_GetObjectItem(ch, "streams");
         if (jstreams && cJSON_IsArray(jstreams)) {
             int sn = cJSON_GetArraySize(jstreams);
+            char https_fallback[SOMA_URL_LEN] = {0};
             for (int j = 0; j < sn; j++) {
                 cJSON *s    = cJSON_GetArrayItem(jstreams, j);
                 cJSON *sfmt = cJSON_GetObjectItem(s, "format");
                 cJSON *surl = cJSON_GetObjectItem(s, "url");
-                if (sfmt && surl &&
-                    cJSON_IsString(sfmt) && cJSON_IsString(surl) &&
-                    strcmp(sfmt->valuestring, "mp3") == 0) {
+                if (!sfmt || !surl ||
+                    !cJSON_IsString(sfmt) || !cJSON_IsString(surl) ||
+                    strcmp(sfmt->valuestring, "mp3") != 0) continue;
+                if (strncmp(surl->valuestring, "http://", 7) == 0) {
                     safe_copy(c->stream_url, surl->valuestring, SOMA_URL_LEN);
                     break;
                 }
+                if (!https_fallback[0])
+                    safe_copy(https_fallback, surl->valuestring, SOMA_URL_LEN);
             }
+            if (!c->stream_url[0] && https_fallback[0])
+                safe_copy(c->stream_url, https_fallback, SOMA_URL_LEN);
         }
 
         /* 2. Construct from id if streams[] gave nothing */
@@ -147,7 +156,7 @@ int soma_fetch_channels(SomaChannelList *out) {
             char id_copy[SOMA_ID_LEN];
             memcpy(id_copy, c->id, SOMA_ID_LEN);
             snprintf(c->stream_url, SOMA_URL_LEN,
-                "https://ice1.somafm.com/%s-128-mp3", id_copy);
+                "http://ice1.somafm.com/%s-128-mp3", id_copy);
         }
 
         /* 3. Fall back to plsfile (mpg123 can parse PLS over HTTP) */

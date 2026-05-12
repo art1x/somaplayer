@@ -13,7 +13,8 @@ typedef struct {
     char title[SOMA_TITLE_LEN];
     char description[SOMA_DESC_LEN];
     char genre[SOMA_GENRE_LEN];
-    char stream_url[SOMA_URL_LEN];  /* direct HTTP MP3 stream */
+    char stream_url[SOMA_URL_LEN];   /* direct HTTP MP3 stream */
+    char image_url[SOMA_URL_LEN];    /* 256 px cover art (largeimage) */
     int  listeners;
 } SomaChannel;
 
