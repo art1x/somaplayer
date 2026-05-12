@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 // ----------------------------------------------------------------
 // Screen-state constants (used in the Now Playing loop)
@@ -157,6 +158,68 @@ static ap_status_bar_opts g_status_bar = {
 static SDL_Texture *g_cover_tex       = NULL;
 static int          g_cover_chan_idx  = -2;  /* -2 = none loaded */
 
+/* Now-playing metadata (background polling thread) */
+static volatile int    g_np_running  = 0;
+static pthread_mutex_t g_np_mutex    = PTHREAD_MUTEX_INITIALIZER;
+static char            g_np_title[SOMA_NP_LEN]  = "";
+static char            g_np_artist[SOMA_NP_LEN] = "";
+static int             g_np_for_idx = -1;
+
+static void *np_poll_thread(void *arg) {
+    (void)arg;
+    int first = 1;
+    while (g_np_running) {
+        if (!first) {
+            for (int i = 0; i < 30 && g_np_running; i++)
+                sleep(1);
+        }
+        first = 0;
+        if (!g_np_running) break;
+
+        pthread_mutex_lock(&g_np_mutex);
+        int idx = g_np_for_idx;
+        pthread_mutex_unlock(&g_np_mutex);
+
+        if (idx < 0 || idx >= g_channels.count) continue;
+
+        char title[SOMA_NP_LEN]  = "";
+        char artist[SOMA_NP_LEN] = "";
+        soma_fetch_now_playing(g_channels.channels[idx].id, title, artist);
+
+        pthread_mutex_lock(&g_np_mutex);
+        if (g_np_for_idx == idx) {
+            memcpy(g_np_title,  title,  SOMA_NP_LEN);
+            memcpy(g_np_artist, artist, SOMA_NP_LEN);
+        }
+        pthread_mutex_unlock(&g_np_mutex);
+    }
+    return NULL;
+}
+
+static void np_start(int chan_idx) {
+    pthread_mutex_lock(&g_np_mutex);
+    g_np_for_idx = chan_idx;
+    g_np_title[0]  = '\0';
+    g_np_artist[0] = '\0';
+    pthread_mutex_unlock(&g_np_mutex);
+
+    if (!g_np_running) {
+        g_np_running = 1;
+        pthread_t t;
+        pthread_create(&t, NULL, np_poll_thread, NULL);
+        pthread_detach(t);
+    }
+}
+
+static void np_stop(void) {
+    g_np_running = 0;
+    pthread_mutex_lock(&g_np_mutex);
+    g_np_for_idx   = -1;
+    g_np_title[0]  = '\0';
+    g_np_artist[0] = '\0';
+    pthread_mutex_unlock(&g_np_mutex);
+}
+
 // ----------------------------------------------------------------
 // Player state persistence (background playback across app launches)
 // ----------------------------------------------------------------
@@ -272,6 +335,7 @@ static void show_message(const char *title, const char *body) {
 // ----------------------------------------------------------------
 static int play_channel(int idx) {
     player_stop();
+    np_stop();
     if (!player_play(g_channels.channels[idx].stream_url)) {
         show_message("Error", "Could not start playback.\nIs mpg123 available?");
         return 0;
@@ -284,6 +348,7 @@ static int play_channel(int idx) {
         return 0;
     }
     g_playing_idx = idx;
+    np_start(idx);
     return 1;
 }
 
@@ -421,6 +486,15 @@ static void render_now_playing(int idx) {
         strncat(info_buf, lbuf, sizeof(info_buf) - strlen(info_buf) - 1);
     }
 
+    /* Read now-playing metadata (written by background thread) */
+    char np_title[SOMA_NP_LEN]  = "";
+    char np_artist[SOMA_NP_LEN] = "";
+    pthread_mutex_lock(&g_np_mutex);
+    memcpy(np_title,  g_np_title,  SOMA_NP_LEN);
+    memcpy(np_artist, g_np_artist, SOMA_NP_LEN);
+    pthread_mutex_unlock(&g_np_mutex);
+    int has_np = np_title[0] || np_artist[0];
+
     int title_h = flg  ? TTF_FontHeight(flg)  : 0;
     int info_h  = fsm  ? TTF_FontHeight(fsm)   : 0;
     int desc_h  = fxsm && ch->description[0] ? TTF_FontHeight(fxsm) : 0;
@@ -429,15 +503,16 @@ static void render_now_playing(int idx) {
     /* When no cover: vertically center the text block */
     if (!g_cover_tex) {
         int total_h = title_h
-                    + (info_buf[0]        ? AP_S(6)  + info_h : 0)
-                    + (ch->description[0] ? AP_S(10) + desc_h : 0);
+                    + (info_buf[0]        ? AP_S(6)  + info_h  : 0)
+                    + (ch->description[0] ? AP_S(10) + desc_h  : 0)
+                    + (has_np             ? AP_S(10) + info_h  : 0);
         y = cont_top + (cont_h - total_h) / 2;
         if (y < cont_top) y = cont_top;
     }
 
     if (flg) {
-        ap_color tc = (st == PLAYER_PLAYING) ? thm->accent : thm->text;
-        ap_draw_text_ellipsized(flg, title_buf, pad, y, tc, text_maxw);
+        ap_color lightgray = {210, 210, 210, 255};
+        ap_draw_text_ellipsized(flg, title_buf, pad, y, lightgray, text_maxw);
         y += title_h;
     }
     if (fsm && info_buf[0]) {
@@ -448,6 +523,20 @@ static void render_now_playing(int idx) {
     if (fxsm && ch->description[0]) {
         y += AP_S(10);
         ap_draw_text_ellipsized(fxsm, ch->description, pad, y, thm->text, text_maxw);
+        y += desc_h;
+    }
+    if (fsm && has_np) {
+        char np_buf[SOMA_NP_LEN * 2 + 8];
+        if (np_artist[0] && np_title[0])
+            snprintf(np_buf, sizeof(np_buf),
+                     "\xe2\x99\xaa %s \xe2\x80\x93 %s", np_artist, np_title);
+        else if (np_artist[0])
+            snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_artist);
+        else
+            snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_title);
+        y += AP_S(10);
+        ap_color np_gray = {210, 210, 210, 255};
+        ap_draw_text_ellipsized(fsm, np_buf, pad, y, np_gray, text_maxw);
     }
 
     ap_footer_item footer[] = {
@@ -499,10 +588,19 @@ static void screen_now_playing(int idx) {
 
             last_input = SDL_GetTicks();
 
+            if (ev.button == AP_BTN_SELECT) {
+                scr = SCREEN_OFF;
+                ap_set_power_handler(false);
+#ifdef PLATFORM_TG5040
+                backlight_off();
+#endif
+                continue;
+            }
             if (ev.button == AP_BTN_B) return;
             if (ev.button == AP_BTN_MENU) { screen_settings(); last_input = SDL_GetTicks(); continue; }
             if (ev.button == AP_BTN_A) {
                 player_stop();
+                np_stop();
                 g_playing_idx = -1;
                 state_clear();
                 return;
@@ -610,6 +708,7 @@ static int screen_stations(void) {
     }
     if (result.action == AP_ACTION_SECONDARY_TRIGGERED) {
         player_stop();
+        np_stop();
         g_playing_idx = -1;
         state_clear();
         return 1;
@@ -695,6 +794,7 @@ static int screen_favorites(void) {
     }
     if (result.action == AP_ACTION_SECONDARY_TRIGGERED) {
         player_stop();
+        np_stop();
         g_playing_idx = -1;
         state_clear();
         return 1;
@@ -779,12 +879,32 @@ static void render_main_menu(int cursor) {
 }
 
 static void screen_main_menu(void) {
-    int cursor = 0;
+    int cursor  = 0;
+    int scr_off = 0;
 
     while (1) {
         ap_input_event ev;
         while (ap_poll_input(&ev)) {
             if (!ev.pressed) continue;
+
+            if (ev.button == AP_BTN_SELECT) {
+                scr_off = 1;
+                ap_set_power_handler(false);
+#ifdef PLATFORM_TG5040
+                backlight_off();
+#endif
+                continue;
+            }
+
+            if (scr_off) {
+                scr_off = 0;
+                ap_set_power_handler(true);
+#ifdef PLATFORM_TG5040
+                backlight_on();
+#endif
+                continue;
+            }
+
             switch (ev.button) {
                 case AP_BTN_UP:
                     cursor = cursor > 0 ? cursor - 1 : 1;
@@ -799,6 +919,7 @@ static void screen_main_menu(void) {
                 case AP_BTN_Y:
                     if (g_playing_idx >= 0) {
                         player_stop();
+                        np_stop();
                         g_playing_idx = -1;
                         state_clear();
                     }
@@ -816,8 +937,14 @@ static void screen_main_menu(void) {
                 default: break;
             }
         }
-        render_main_menu(cursor);
-        SDL_Delay(16);
+
+        if (scr_off) {
+            render_screen_off(0);
+            SDL_Delay(50);
+        } else {
+            render_main_menu(cursor);
+            SDL_Delay(16);
+        }
     }
 }
 
@@ -859,6 +986,7 @@ int main(void) {
         if (restored >= 0) {
             g_playing_idx = restored;
             load_cover(restored);
+            np_start(restored);
         }
     }
 
