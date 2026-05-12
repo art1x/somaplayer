@@ -36,7 +36,7 @@ static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, CurlBuf *buf) 
     return bytes;
 }
 
-static char *http_get(const char *url) {
+static char *http_get(const char *url, long timeout_sec) {
     CURL *curl = curl_easy_init();
     if (!curl) return NULL;
 
@@ -44,7 +44,7 @@ static char *http_get(const char *url) {
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
         "SomaPak/1.0 (NextUI TrimUI; github.com/art1x)");
@@ -83,7 +83,7 @@ void soma_cleanup(void) {
 int soma_fetch_channels(SomaChannelList *out) {
     out->count = 0;
 
-    char *json = http_get(SOMA_API_URL);
+    char *json = http_get(SOMA_API_URL, 15L);
     if (!json) return 0;
 
     cJSON *root = cJSON_Parse(json);
@@ -174,4 +174,36 @@ int soma_fetch_channels(SomaChannelList *out) {
 
     qsort(out->channels, (size_t)out->count, sizeof(SomaChannel), channel_cmp);
     return count > 0 ? 1 : 0;
+}
+
+int soma_fetch_now_playing(const char *channel_id,
+                           char *title, char *artist) {
+    title[0] = artist[0] = '\0';
+
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://api.somafm.com/songs/%s.json", channel_id);
+
+    char *json = http_get(url, 5L);
+    if (!json) return 0;
+
+    cJSON *root = cJSON_Parse(json);
+    free(json);
+    if (!root) return 0;
+
+    int ok = 0;
+    cJSON *songs = cJSON_GetObjectItem(root, "songs");
+    if (songs && cJSON_IsArray(songs) && cJSON_GetArraySize(songs) > 0) {
+        cJSON *first   = cJSON_GetArrayItem(songs, 0);
+        cJSON *jtitle  = cJSON_GetObjectItem(first, "title");
+        cJSON *jartist = cJSON_GetObjectItem(first, "artist");
+        if (jtitle  && cJSON_IsString(jtitle))
+            safe_copy(title,  jtitle->valuestring,  SOMA_NP_LEN);
+        if (jartist && cJSON_IsString(jartist))
+            safe_copy(artist, jartist->valuestring, SOMA_NP_LEN);
+        ok = 1;
+    }
+
+    cJSON_Delete(root);
+    return ok;
 }

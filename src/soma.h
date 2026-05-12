@@ -7,6 +7,7 @@
 #define SOMA_DESC_LEN     280
 #define SOMA_GENRE_LEN    64
 #define SOMA_URL_LEN      256
+#define SOMA_NP_LEN       128
 
 typedef struct {
     char id[SOMA_ID_LEN];
@@ -29,5 +30,11 @@ void soma_cleanup(void);
 /* Fetch and parse the SomaFM channel list.
    Returns 1 on success (out->count > 0), 0 on network or parse error. */
 int soma_fetch_channels(SomaChannelList *out);
+
+/* Fetch now-playing track for a channel.
+   title and artist buffers must each be SOMA_NP_LEN bytes.
+   Returns 1 on success, 0 on failure. */
+int soma_fetch_now_playing(const char *channel_id,
+                           char *title, char *artist);
 
 #endif
