@@ -220,56 +220,6 @@ static void np_stop(void) {
     pthread_mutex_unlock(&g_np_mutex);
 }
 
-// ----------------------------------------------------------------
-// Player state persistence (background playback across app launches)
-// ----------------------------------------------------------------
-static void state_save(int chan_idx) {
-    char path[280];
-    snprintf(path, sizeof(path), "%s/state.txt", userdata_dir());
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "pid=%d\nchannel_id=%s\n",
-            (int)player_get_pid(),
-            g_channels.channels[chan_idx].id);
-    fclose(f);
-}
-
-static void state_clear(void) {
-    char path[280];
-    snprintf(path, sizeof(path), "%s/state.txt", userdata_dir());
-    remove(path);
-}
-
-static int state_restore(void) {
-    char path[280];
-    snprintf(path, sizeof(path), "%s/state.txt", userdata_dir());
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-
-    int  pid = 0;
-    char channel_id[SOMA_ID_LEN] = {0};
-    char key[32], val[SOMA_ID_LEN];
-    while (fscanf(f, " %31[^=]=%63s", key, val) == 2) {
-        if (strcmp(key, "pid")        == 0) pid = atoi(val);
-        if (strcmp(key, "channel_id") == 0)
-            memcpy(channel_id, val, sizeof(channel_id) - 1);
-    }
-    fclose(f);
-
-    if (pid <= 0 || !channel_id[0]) { state_clear(); return -1; }
-    if (kill((pid_t)pid, 0) != 0)   { state_clear(); return -1; }
-
-    for (int i = 0; i < g_channels.count; i++) {
-        if (strcmp(g_channels.channels[i].id, channel_id) == 0) {
-            player_adopt((pid_t)pid);
-            return i;
-        }
-    }
-    kill((pid_t)pid, SIGTERM);
-    state_clear();
-    return -1;
-}
-
 /* UTF-8 literals used in trailing text / labels */
 #define MARK_PLAY "\xe2\x96\xb6 "   /* ▶  */
 #define MARK_STAR "\xe2\x98\x85 "   /* ★  */
@@ -602,7 +552,6 @@ static void screen_now_playing(int idx) {
                 player_stop();
                 np_stop();
                 g_playing_idx = -1;
-                state_clear();
                 return;
             }
         }
@@ -708,7 +657,6 @@ static int screen_stations(void) {
         player_stop();
         np_stop();
         g_playing_idx = -1;
-        state_clear();
         return 1;
     }
 
@@ -794,7 +742,6 @@ static int screen_favorites(void) {
         player_stop();
         np_stop();
         g_playing_idx = -1;
-        state_clear();
         return 1;
     }
 
@@ -857,7 +804,7 @@ static void render_main_menu(int cursor) {
         { .button = AP_BTN_A,    .label = "Open", .is_confirm = true    },
     };
     ap_footer_item footer_stop[] = {
-        { .button = AP_BTN_B,    .label = "Exit \xe2\x96\xb6"          },  /* Exit ▶ = keeps playing */
+        { .button = AP_BTN_B,    .label = "Exit"                        },
         { .button = AP_BTN_MENU, .label = "Settings"                    },
         { .button = AP_BTN_Y,    .label = "Stop"                        },
         { .button = AP_BTN_A,    .label = "Open", .is_confirm = true    },
@@ -918,18 +865,12 @@ static void screen_main_menu(void) {
                         player_stop();
                         np_stop();
                         g_playing_idx = -1;
-                        state_clear();
                     }
                     break;
                 case AP_BTN_MENU:
                     screen_settings();
                     break;
                 case AP_BTN_B:
-                    /* Exit app — keep music playing if a station is active */
-                    if (g_playing_idx >= 0) {
-                        state_save(g_playing_idx);
-                        player_detach();
-                    }
                     return;
                 default: break;
             }
@@ -976,16 +917,6 @@ int main(void) {
         show_message("Network Error",
             "Could not load station list.\nCheck your internet connection.");
         goto cleanup;
-    }
-
-    /* Restore background playback session from previous launch */
-    {
-        int restored = state_restore();
-        if (restored >= 0) {
-            g_playing_idx = restored;
-            load_cover(restored);
-            np_start(restored);
-        }
     }
 
     screen_main_menu();

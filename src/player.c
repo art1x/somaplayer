@@ -23,10 +23,6 @@ int player_play(const char *url) {
     if (g_pid < 0) { g_error = 1; return 0; }
 
     if (g_pid == 0) {
-        /* Own process group so signals to the parent don't reach us —
-           this allows the process to survive after the app exits. */
-        setpgid(0, 0);
-
         int devnull = open("/dev/null", O_RDWR);
         if (devnull >= 0) {
             dup2(devnull, STDIN_FILENO);
@@ -68,17 +64,3 @@ PlayerStatus player_status(void) {
     return PLAYER_STOPPED;
 }
 
-pid_t player_get_pid(void) { return g_pid; }
-
-void player_detach(void) {
-    /* Release ownership without sending any signal.
-       mpg123 becomes an orphan adopted by init and keeps playing. */
-    g_pid   = -1;
-    g_error = 0;
-}
-
-void player_adopt(pid_t pid) {
-    player_stop();
-    g_pid   = pid;
-    g_error = 0;
-}
