@@ -544,8 +544,7 @@ static void render_main(void) {
         int list_pad_x = AP_S(12);
         /* Keep list text away from the cover; use the full left portion */
         int list_maxw  = cover_x - AP_S(8);
-        int line_h     = TTF_FontHeight(fxsm);
-        int item_h     = line_h * 2 + AP_S(6);  /* title + genre line */
+        int item_h     = TTF_FontHeight(fxsm) + AP_S(5);
         int visible    = cont_h / item_h;   /* how many items fit on screen */
 
         /* True centred-cursor scroll: cursor is always at position `half`.
@@ -578,25 +577,21 @@ static void render_main(void) {
                 ap_draw_rect(0, iy, cover_x, item_h, play_bg);
             }
 
-            /* Line 1: "▶ ★ Station Name" */
-            char label[128] = "";
+            /* Single line: "▶ ★ Station Name  ·  Genre" (ellipsized if too long) */
+            char label[192] = "";
             if (playing) strcat(label, MARK_PLAY);
             if (fav)     strcat(label, MARK_STAR);
             strncat(label, ch->title, sizeof(label) - strlen(label) - 1);
+            if (ch->genre[0]) {
+                strncat(label, "  \xc2\xb7  ", sizeof(label) - strlen(label) - 1);
+                strncat(label, ch->genre,      sizeof(label) - strlen(label) - 1);
+            }
 
             /* Cursor → highlighted_text, playing → accent color, otherwise → text */
             ap_color tc = sel     ? thm->highlighted_text :
                           playing ? thm->accent            :
                                     thm->text;
             ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
-
-            /* Line 2: genre (dimmer, smaller visual weight) */
-            if (ch->genre[0]) {
-                ap_color gc = thm->hint;
-                ap_draw_text_ellipsized(fxsm, ch->genre,
-                                        list_pad_x + AP_S(4), iy + line_h + AP_S(1),
-                                        gc, list_maxw - AP_S(4));
-            }
         }
     }
 
