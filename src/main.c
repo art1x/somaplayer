@@ -35,6 +35,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 // ----------------------------------------------------------------
 // Global state
@@ -44,6 +45,10 @@ static int             g_playing_idx      = -1;   /* index of playing channel, -
 static int             g_last_played_idx  = -1;   /* last station that was playing, for START resume */
 static int             g_cursor           = 0;    /* highlighted station in the list */
 static FavoriteList    g_favorites        = {0};
+
+/* Path to the on-disk channels JSON cache; set once in main() after
+   the userdata directory is known.  Used by cache_refresh_thread(). */
+static char g_channels_cache_path[320] = "";
 
 static ap_status_bar_opts g_status_bar = {
     .show_clock   = AP_CLOCK_AUTO,
@@ -57,6 +62,14 @@ static int           g_cover_chan_idx = -2;   /* channel whose cover is displaye
 static volatile int  g_cover_loading  = 0;    /* download in progress */
 static volatile int  g_cover_dl_done  = 0;    /* file saved, needs texture creation */
 static          int  g_cover_dl_idx   = -1;   /* channel that was just downloaded */
+static          char g_cover_dl_path[320] = ""; /* path of the ready-to-load file */
+
+
+/* Sleep timer: milliseconds remaining; 0 = off */
+static uint32_t g_sleep_timer_ms = 0;
+
+/* Description pill: hide after 10 s of no navigation; reset on every cursor move */
+static uint32_t g_desc_hide_at = 0;
 
 /* Now-playing ticker scroll state */
 static uint32_t g_ticker_ms   = 0;
@@ -119,9 +132,9 @@ static void *np_poll_thread(void *arg) {
         char artist[SOMA_NP_LEN] = "";
         soma_fetch_now_playing(g_channels.channels[idx].id, title, artist);
 
-        /* Only store the result if the channel hasn't changed while we were fetching */
+        /* Only overwrite if channel unchanged and new data is non-empty */
         pthread_mutex_lock(&g_np_mutex);
-        if (g_np_for_idx == idx) {
+        if (g_np_for_idx == idx && (title[0] || artist[0])) {
             memcpy(g_np_title,  title,  SOMA_NP_LEN);
             memcpy(g_np_artist, artist, SOMA_NP_LEN);
         }
@@ -134,9 +147,8 @@ static void *np_poll_thread(void *arg) {
    If the thread is already running it keeps running; only the target channel changes. */
 static void np_start(int chan_idx) {
     pthread_mutex_lock(&g_np_mutex);
-    g_np_for_idx   = chan_idx;
-    g_np_title[0]  = '\0';
-    g_np_artist[0] = '\0';
+    g_np_for_idx = chan_idx;
+    /* Keep old title/artist visible until the new station's first poll returns */
     pthread_mutex_unlock(&g_np_mutex);
 
     if (!g_np_running) {
@@ -151,10 +163,33 @@ static void np_start(int chan_idx) {
 static void np_stop(void) {
     g_np_running = 0;
     pthread_mutex_lock(&g_np_mutex);
-    g_np_for_idx   = -1;
-    g_np_title[0]  = '\0';
-    g_np_artist[0] = '\0';
+    g_np_for_idx = -1;
+    /* Keep title/artist — last known song stays visible after stopping */
     pthread_mutex_unlock(&g_np_mutex);
+}
+
+// ----------------------------------------------------------------
+// Channel cache background refresh
+// ----------------------------------------------------------------
+
+/* Fetches a fresh channel list from the SomaFM API in the background
+   and saves it to the on-disk cache so the next launch can skip the
+   network wait entirely.  We deliberately do NOT update g_channels at
+   runtime — that avoids any thread-safety issues with the now-playing
+   thread, which reads g_channels without locking. */
+static void *cache_refresh_thread(void *arg) {
+    (void)arg;
+    soma_channels_cache_refresh(g_channels_cache_path);
+    return NULL;
+}
+
+/* Launch the background cache refresh (fire-and-forget).
+   Called once after a successful cache-hit startup so the next session
+   gets an up-to-date station list without the user waiting. */
+static void start_cache_refresh(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, cache_refresh_thread, NULL) == 0)
+        pthread_detach(t);
 }
 
 // ----------------------------------------------------------------
@@ -166,63 +201,85 @@ static size_t cover_write_cb(void *ptr, size_t size, size_t nmemb, FILE *fp) {
     return fwrite(ptr, size, nmemb, fp);
 }
 
-/* Background thread: downloads the cover image to /tmp/soma_cover.png.
-   Sets g_cover_dl_done when finished so the main thread can create the texture.
-   SDL textures MUST be created on the main thread — the thread only saves the file. */
-typedef struct { int idx; char url[SOMA_URL_LEN]; } CoverDlArg;
+/* Background thread: loads or downloads cover art.
+   Checks the local cache first; only fetches from network if absent.
+   Sets g_cover_dl_done when the file is ready so the main thread creates the texture.
+   SDL textures MUST be created on the main thread. */
+typedef struct {
+    int  idx;
+    char url[SOMA_URL_LEN];
+    char cache_path[320];
+} CoverDlArg;
 
 static void *cover_dl_thread(void *arg) {
     CoverDlArg *a = arg;
     int  idx = a->idx;
+    char cache_path[320];
+    memcpy(cache_path, a->cache_path, sizeof(cache_path));
     char url[SOMA_URL_LEN];
     memcpy(url, a->url, SOMA_URL_LEN);
     free(a);
 
-    const char *tmp = "/tmp/soma_cover.png";
-    CURL *curl = curl_easy_init();
-    if (!curl) { g_cover_loading = 0; return NULL; }
-    FILE *fp = fopen(tmp, "wb");
-    if (!fp) { curl_easy_cleanup(curl); g_cover_loading = 0; return NULL; }
+    /* Use cached file if it already exists */
+    if (access(cache_path, F_OK) != 0) {
+        /* Not cached — download now */
+        CURL *curl = curl_easy_init();
+        if (!curl) { g_cover_loading = 0; return NULL; }
+        FILE *fp = fopen(cache_path, "wb");
+        if (!fp) { curl_easy_cleanup(curl); g_cover_loading = 0; return NULL; }
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cover_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cover_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 #ifdef PLATFORM_TG5040
-    curl_easy_setopt(curl, CURLOPT_CAINFO, "./cacert.pem");
+        curl_easy_setopt(curl, CURLOPT_CAINFO, "./cacert.pem");
 #endif
-    CURLcode res = curl_easy_perform(curl);
-    curl_easy_cleanup(curl);
-    fclose(fp);
+        CURLcode res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+        fclose(fp);
 
-    if (res == CURLE_OK) {
-        /* Signal main thread to create the texture */
-        g_cover_dl_idx  = idx;
-        g_cover_dl_done = 1;
+        if (res != CURLE_OK) {
+            remove(cache_path);   /* delete incomplete file */
+            g_cover_loading = 0;
+            return NULL;
+        }
     }
+
+    /* File is ready (cached or freshly downloaded) */
+    memcpy(g_cover_dl_path, cache_path, sizeof(g_cover_dl_path));
+    g_cover_dl_idx  = idx;
+    g_cover_dl_done = 1;
     g_cover_loading = 0;
     return NULL;
 }
 
-/* Start an async cover art download for channel chan_idx.
-   The texture is created on the main thread when g_cover_dl_done is set. */
+/* Start an async cover load for channel chan_idx.
+   Serves from local cache when available; downloads otherwise. */
 static void load_cover(int chan_idx) {
-    if (chan_idx == g_cover_chan_idx && !g_cover_loading) return;  /* already have it */
-    if (g_cover_loading) return;   /* another download is already running */
+    if (chan_idx == g_cover_chan_idx && !g_cover_loading) return;
+    if (g_cover_loading) return;
 
-    /* Clear the current texture immediately so the screen shows no stale art */
+    /* Clear stale texture immediately */
     if (g_cover_tex) { SDL_DestroyTexture(g_cover_tex); g_cover_tex = NULL; }
     g_cover_chan_idx = chan_idx;
     g_cover_dl_done  = 0;
 
     const char *url = g_channels.channels[chan_idx].image_url;
-    if (!url[0]) return;   /* channel has no artwork URL */
+    if (!url[0]) return;
+
+    /* Build cache path: userdata_dir/covers/<id>.png */
+    char covers_dir[300];
+    snprintf(covers_dir, sizeof(covers_dir), "%s/covers", userdata_dir());
+    mkdir(covers_dir, 0755);   /* create directory if absent; ignore error if exists */
 
     CoverDlArg *arg = malloc(sizeof(CoverDlArg));
     if (!arg) return;
     arg->idx = chan_idx;
     memcpy(arg->url, url, SOMA_URL_LEN);
+    snprintf(arg->cache_path, sizeof(arg->cache_path), "%s/%s.png",
+             covers_dir, g_channels.channels[chan_idx].id);
 
     g_cover_loading = 1;
     pthread_t t;
@@ -370,9 +427,10 @@ static void render_key_hint_overlay(void) {
         "\xe2\x86\x91 / \xe2\x86\x93     \xe2\x80\x94   Navigate list",
         "\xe2\x86\x90 / \xe2\x86\x92     \xe2\x80\x94   Previous / Next station",
         "X           \xe2\x80\x94   Toggle favourite \xe2\x98\x85",
+        "SELECT      \xe2\x80\x94   Sleep timer",
         "B           \xe2\x80\x94   Quit",
     };
-    int hint_count = 6;
+    int hint_count = 7;
 
     /* Layout: heading + URL together at top, then gap, then key hints */
     int title_h = flg ? TTF_FontHeight(flg) + AP_S(6)  : AP_S(30);
@@ -462,104 +520,6 @@ static void render_main(void) {
     /* ── Status bar (battery / clock / wifi) ───────────────────── */
     ap_draw_status_bar(&g_status_bar);
 
-    /* ── Now-playing pill in the centre of the status bar ───────── */
-    /* Read metadata written by the background polling thread. */
-    {
-        char np_title[SOMA_NP_LEN]  = "";
-        char np_artist[SOMA_NP_LEN] = "";
-        pthread_mutex_lock(&g_np_mutex);
-        memcpy(np_title,  g_np_title,  SOMA_NP_LEN);
-        memcpy(np_artist, g_np_artist, SOMA_NP_LEN);
-        pthread_mutex_unlock(&g_np_mutex);
-
-        if (fxsm && (np_title[0] || np_artist[0])) {
-            /* Build "♪ Artist – Title  ·  1.2k listeners" */
-            char np_buf[SOMA_NP_LEN * 2 + 32];
-            if (np_artist[0] && np_title[0])
-                snprintf(np_buf, sizeof(np_buf),
-                         "\xe2\x99\xaa %s \xe2\x80\x93 %s", np_artist, np_title);
-            else if (np_artist[0])
-                snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_artist);
-            else
-                snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_title);
-
-            /* Append listener count if available */
-            if (g_playing_idx >= 0) {
-                int lc = g_channels.channels[g_playing_idx].listeners;
-                if (lc > 0) {
-                    char lbuf[24];
-                    if (lc >= 1000)
-                        snprintf(lbuf, sizeof(lbuf), "  \xc2\xb7  %.1fk", lc / 1000.0);
-                    else
-                        snprintf(lbuf, sizeof(lbuf), "  \xc2\xb7  %d", lc);
-                    strncat(np_buf, lbuf, sizeof(np_buf) - strlen(np_buf) - 1);
-                }
-            }
-
-            int text_w = ap_measure_text(fxsm, np_buf);
-            int text_h = TTF_FontHeight(fxsm);
-
-            /* Left-align the pill, vertically centred in the status bar */
-            int tx  = AP_S(12);
-            int ty  = (sb_h - text_h) / 2;
-            int pad = AP_S(6);
-
-            /* Limit pill width to 2/3 of screen so battery/clock stay visible */
-            int pill_maxw = sw * 2 / 3;
-
-            ap_color np_bg = {40, 40, 40, 180};
-            ap_color np_fg = {220, 220, 220, 255};
-
-            int pill_h = text_h + pad;
-            int pill_r = pill_h / 2;   /* fully rounded pill shape */
-
-            if (text_w <= pill_maxw) {
-                /* Text fits: draw static rounded pill */
-                ap_draw_rounded_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, pill_h, pill_r, np_bg);
-                ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
-            } else {
-                /* Text too long: draw scrolling ticker with SDL clip rect */
-                /* Reset scroll when text changes */
-                if (strcmp(np_buf, g_ticker_last) != 0) {
-                    strncpy(g_ticker_last, np_buf, sizeof(g_ticker_last) - 1);
-                    g_ticker_px = 0;
-                    g_ticker_ms = 0;
-                }
-                /* 2 s pause at start, then scroll at 60 px/s */
-                if (g_ticker_ms > 2000)
-                    g_ticker_px = (int)((g_ticker_ms - 2000) * 60 / 1000);
-
-                ap_draw_rounded_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, pill_h, pill_r, np_bg);
-
-                /* Draw text + "   ***   " separator + text again for seamless loop.
-                   The clip rect hides anything outside the pill area. */
-                const char *sep    = "   ***   ";
-                int          sep_w = ap_measure_text(fxsm, sep);
-                int          full_w = text_w + sep_w;   /* one full scroll cycle */
-
-                /* Loop back after one full cycle */
-                if (g_ticker_px > full_w) {
-                    g_ticker_ms = 0;
-                    g_ticker_px = 0;
-                }
-
-                SDL_Renderer *rend = ap_get_renderer();
-                SDL_Rect clip = { tx - pad, 0, pill_maxw + 2 * pad, sb_h };
-                SDL_RenderSetClipRect(rend, &clip);
-
-                ap_color sep_col = {120, 120, 120, 255};
-                /* First copy of text */
-                ap_draw_text(fxsm, np_buf, tx - g_ticker_px,            ty, np_fg);
-                /* Separator */
-                ap_draw_text(fxsm, sep,    tx - g_ticker_px + text_w,   ty, sep_col);
-                /* Second copy (visible during wrap) */
-                ap_draw_text(fxsm, np_buf, tx - g_ticker_px + full_w,   ty, np_fg);
-
-                SDL_RenderSetClipRect(rend, NULL);
-            }
-        }
-    }
-
     /* ── Stations list (left column) ────────────────────────────── */
     if (fxsm && g_channels.count > 0) {
         int list_pad_x = AP_S(12);
@@ -581,6 +541,11 @@ static void render_main(void) {
             SomaChannel *ch      = &g_channels.channels[ch_i];
             bool         sel     = (ch_i == g_cursor);
             bool         playing = (ch_i == g_playing_idx);
+            /* Show the grey highlight pill on the last-played station even when
+               stopped – gives visual continuity. LIVE badge still only appears
+               when actually streaming (playing == true). */
+            bool         paused  = (!playing && ch_i == g_last_played_idx
+                                    && g_last_played_idx >= 0);
             bool         fav     = favorites_contains(&g_favorites, ch->id);
 
             int iy = cont_top + i * item_h;
@@ -588,95 +553,204 @@ static void render_main(void) {
             /* Don't render items that would overlap the footer */
             if (iy + item_h > cont_bot) break;
 
-            /* Single line: "▶ ★ Station Name  ·  Genre" (ellipsized if too long) */
+            /* Draw gold ★ separately for favorites, then the rest of the label */
+            int star_w = 0;
+            if (fav && fxsm) {
+                ap_color gold = {255, 200, 40, 255};
+                ap_draw_text(fxsm, MARK_STAR, list_pad_x, iy, gold);
+                star_w = ap_measure_text(fxsm, MARK_STAR);
+            }
+            int text_x = list_pad_x + star_w;
+
+            /* "Station Name  ·  Genre" (ellipsized if too long) */
             char label[192] = "";
-            if (playing) strcat(label, MARK_PLAY);
-            if (fav)     strcat(label, MARK_STAR);
             strncat(label, ch->title, sizeof(label) - strlen(label) - 1);
             if (ch->genre[0]) {
                 strncat(label, "  \xc2\xb7  ", sizeof(label) - strlen(label) - 1);
                 strncat(label, ch->genre,      sizeof(label) - strlen(label) - 1);
             }
 
-            /* Measure actual text width (capped at list_maxw for the pill) */
-            int tw       = ap_measure_text(fxsm, label);
+            /* Measure actual text width for pill (capped at list_maxw) */
+            int tw       = ap_measure_text(fxsm, label) + star_w;
             if (tw > list_maxw) tw = list_maxw;
             int pill_pad = AP_S(8);
             int pill_x   = list_pad_x - pill_pad;
             int pill_w   = tw + 2 * pill_pad;
-            int pill_r   = item_h / 2;   /* fully rounded ends */
+            int pill_r   = item_h / 2;
 
             /* Rounded highlight pill, sized to the text */
             if (sel) {
                 ap_color white = {255, 255, 255, 230};
                 ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, white);
-            } else if (playing) {
+            } else if (playing || paused) {
                 ap_color play_bg = {180, 180, 180, 160};
                 ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, play_bg);
             }
 
-            /* Cursor → black on white, playing → black on grey, otherwise → text */
-            ap_color tc = sel     ? (ap_color){0,  0,  0, 255} :
-                          playing ? (ap_color){20, 20, 20, 255} :
+            /* Cursor → black on white, playing/paused → black on grey, otherwise → text */
+            ap_color tc = sel            ? (ap_color){0,  0,  0, 255} :
+                          (playing || paused) ? (ap_color){20, 20, 20, 255} :
                                     thm->text;
-            ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
+            ap_draw_text_ellipsized(fxsm, label, text_x, iy, tc, list_maxw - star_w);
 
-            /* LIVE badge: small red pill after the text of the playing station */
+            /* LIVE badge + listener count next to the playing station's pill */
             if (playing && fxsm) {
                 int lw = ap_measure_text(fxsm, "LIVE");
                 int lh = TTF_FontHeight(fxsm);
                 int lp = AP_S(5);
                 int lx = pill_x + pill_w + AP_S(6);
                 int ly = iy + (item_h - lh) / 2;
-                /* Only draw if it fits on screen */
                 if (lx + lw + 2 * lp <= sw) {
                     ap_color live_bg = {200, 30, 30, 220};
                     ap_color live_fg = {255, 255, 255, 255};
                     ap_draw_rounded_rect(lx, ly - lp / 2, lw + 2 * lp, lh + lp, lh / 2, live_bg);
                     ap_draw_text(fxsm, "LIVE", lx + lp, ly, live_fg);
+
+                    /* Listener count in grey, no background, right after the LIVE pill */
+                    int lc = g_channels.channels[ch_i].listeners;
+                    if (lc > 0) {
+                        char lbuf[24];
+                        if (lc >= 1000)
+                            snprintf(lbuf, sizeof(lbuf), "%.1fk", lc / 1000.0);
+                        else
+                            snprintf(lbuf, sizeof(lbuf), "%d", lc);
+                        int cx = lx + lw + 2 * lp + AP_S(6);
+                        ap_color grey = {200, 200, 200, 255};
+                        ap_draw_text(fxsm, lbuf, cx, ly, grey);
+                    }
                 }
             }
         }
 
-        /* ── List vignette: fade top and bottom items into black ── */
-        {
-            int vign_h = item_h * 2;
-            int steps  = 16;
-            for (int i = 0; i < steps; i++) {
-                Uint8 a = (Uint8)(200 - (200 * i / (steps - 1)));
-                ap_color c = {0, 0, 0, a};
-                /* Top — list area only, don't touch the cover */
-                ap_draw_rect(0, cont_top + vign_h * i / steps,
-                             cover_x, vign_h / steps + 1, c);
-                /* Bottom */
-                ap_draw_rect(0, cont_bot - vign_h + vign_h * i / steps,
-                             cover_x, vign_h / steps + 1,
-                             (ap_color){0, 0, 0, 200 - (Uint8)a});
+    }
+
+
+    /* ── Status bar and now-playing pill ───────────────────────── */
+    ap_draw_status_bar(&g_status_bar);
+
+    {
+        char np_title[SOMA_NP_LEN]  = "";
+        char np_artist[SOMA_NP_LEN] = "";
+        pthread_mutex_lock(&g_np_mutex);
+        memcpy(np_title,  g_np_title,  SOMA_NP_LEN);
+        memcpy(np_artist, g_np_artist, SOMA_NP_LEN);
+        pthread_mutex_unlock(&g_np_mutex);
+
+        if (fxsm && (np_title[0] || np_artist[0])) {
+            char np_buf[SOMA_NP_LEN * 2 + 32];
+            if (np_artist[0] && np_title[0])
+                snprintf(np_buf, sizeof(np_buf),
+                         "\xe2\x99\xaa %s \xe2\x80\x93 %s", np_artist, np_title);
+            else if (np_artist[0])
+                snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_artist);
+            else
+                snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_title);
+
+            if (g_playing_idx >= 0) {
+                int lc = g_channels.channels[g_playing_idx].listeners;
+                if (lc > 0) {
+                    char lbuf[24];
+                    if (lc >= 1000)
+                        snprintf(lbuf, sizeof(lbuf), "  \xc2\xb7  %.1fk", lc / 1000.0);
+                    else
+                        snprintf(lbuf, sizeof(lbuf), "  \xc2\xb7  %d", lc);
+                    strncat(np_buf, lbuf, sizeof(np_buf) - strlen(np_buf) - 1);
+                }
+            }
+
+            int text_w = ap_measure_text(fxsm, np_buf);
+            int text_h = TTF_FontHeight(fxsm);
+            int tx  = AP_S(12);
+            int ty  = (sb_h - text_h) / 2;
+            int pad = AP_S(6);
+            int pill_maxw = sw * 2 / 3;
+            ap_color np_bg = {40, 40, 40, 180};
+            ap_color np_fg = {220, 220, 220, 255};
+            int pill_h = text_h + pad;
+            int pill_r = pill_h / 2;
+
+            if (text_w <= pill_maxw) {
+                ap_draw_rounded_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, pill_h, pill_r, np_bg);
+                ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
+            } else {
+                if (strcmp(np_buf, g_ticker_last) != 0) {
+                    strncpy(g_ticker_last, np_buf, sizeof(g_ticker_last) - 1);
+                    g_ticker_px = 0;
+                    g_ticker_ms = 0;
+                }
+                if (g_ticker_ms > 2000)
+                    g_ticker_px = (int)((g_ticker_ms - 2000) * 60 / 1000);
+
+                ap_draw_rounded_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, pill_h, pill_r, np_bg);
+
+                const char *sep   = "   ***   ";
+                int          sep_w = ap_measure_text(fxsm, sep);
+                int          full_w = text_w + sep_w;
+                if (g_ticker_px > full_w) { g_ticker_ms = 0; g_ticker_px = 0; }
+
+                SDL_Renderer *rend = ap_get_renderer();
+                SDL_Rect clip = { tx - pad, 0, pill_maxw + 2 * pad, sb_h };
+                SDL_RenderSetClipRect(rend, &clip);
+                ap_color sep_col = {120, 120, 120, 255};
+                ap_draw_text(fxsm, np_buf, tx - g_ticker_px,           ty, np_fg);
+                ap_draw_text(fxsm, sep,    tx - g_ticker_px + text_w,  ty, sep_col);
+                ap_draw_text(fxsm, np_buf, tx - g_ticker_px + full_w,  ty, np_fg);
+                SDL_RenderSetClipRect(rend, NULL);
             }
         }
+    }
+
+    /* ── Gradual dim overlay (F) ────────────────────────────────── */
+    {
+        uint8_t dim = screen_dim_alpha();
+        if (dim > 0)
+            ap_draw_rect(0, 0, sw, sh, (ap_color){0, 0, 0, dim});
     }
 
     /* ── Footer ─────────────────────────────────────────────────── */
     /* START is the central Play/Stop action; A selects/switches station. */
     {
-        ap_footer_item footer_play[] = {
-            { .button = AP_BTN_B,     .label = "Exit"                        },
-            { .button = AP_BTN_X,     .label = "\xe2\x98\x85"                },
-            { .button = AP_BTN_START, .label = "Play/Stop"                   },
-            { .button = AP_BTN_A,     .label = "Select", .is_confirm = true  },
+        ap_footer_item footer[] = {
+            { .button = AP_BTN_MENU, .label = "Key Hints" },
         };
-        ap_footer_item footer_stop[] = {
-            { .button = AP_BTN_B,     .label = "Exit"                        },
-            { .button = AP_BTN_X,     .label = "\xe2\x98\x85"                },
-            { .button = AP_BTN_START, .label = "Play/Stop"                   },
-            { .button = AP_BTN_A,     .label = "Select", .is_confirm = true  },
-        };
-        if (g_playing_idx >= 0)
-            ap_draw_footer(footer_stop, 4);
-        else
-            ap_draw_footer(footer_play, 4);
+        ap_draw_footer(footer, 1);
+    }
+
+    /* ── Channel description pill (bottom-right inside footer) ──── */
+    /* Visible for 10 s after the last navigation input, then hides.
+       Shows up to 2 wrapped lines; SDL clip rect prevents overflow. */
+    if (fxsm && g_cursor >= 0 && g_cursor < g_channels.count
+        && SDL_GetTicks() < g_desc_hide_at) {
+        const char *desc = g_channels.channels[g_cursor].description;
+        if (desc && desc[0]) {
+            int pad       = AP_S(8);
+            int text_h    = TTF_FontHeight(fxsm);
+            int line_skip = TTF_FontLineSkip(fxsm);
+            int two_line_h = text_h + line_skip;
+            int pill_h    = two_line_h + pad;
+            int pill_r    = pill_h / 2;   /* true pill shape */
+            int max_w     = sw / 2;
+            int pill_w    = max_w + 2 * pad;
+            int pill_x    = sw - pill_w - AP_S(12);
+            int pill_y    = sh - ft_h + (ft_h - pill_h) / 2;
+
+            ap_color bg  = {40, 40, 40, 180};
+            ap_color fg  = {200, 200, 200, 255};
+            ap_draw_rounded_rect(pill_x, pill_y, pill_w, pill_h, pill_r, bg);
+
+            SDL_Renderer *rend = ap_get_renderer();
+            SDL_Rect clip = { pill_x + pad, pill_y + pad / 2,
+                              max_w, two_line_h };
+            SDL_RenderSetClipRect(rend, &clip);
+            ap_draw_text_wrapped(fxsm, desc,
+                                 pill_x + pad, pill_y + pad / 2,
+                                 max_w, fg, AP_ALIGN_LEFT);
+            SDL_RenderSetClipRect(rend, NULL);
+        }
     }
 }
+
+static void show_sleep_timer(void);   /* defined below */
 
 // ----------------------------------------------------------------
 // Main screen loop – the only screen in the app
@@ -684,6 +758,9 @@ static void render_main(void) {
 static void screen_main(void) {
     bool     show_hint  = false;
     uint32_t last_ticks = SDL_GetTicks();
+
+    /* Show description pill immediately on launch for 10 s */
+    g_desc_hide_at = SDL_GetTicks() + 10000;
 
     /* Pre-load the cover for the initial cursor position so something
        is visible right away when the user opens the app. */
@@ -700,6 +777,16 @@ static void screen_main(void) {
         /* ── Ticker time ─────────────────────────────────────────── */
         if (!screen_is_off()) g_ticker_ms += elapsed;
 
+        /* ── Sleep timer ─────────────────────────────────────────── */
+        if (g_sleep_timer_ms > 0) {
+            if (elapsed >= g_sleep_timer_ms) {
+                g_sleep_timer_ms = 0;
+                player_stop(); np_stop(); g_playing_idx = -1;
+            } else {
+                g_sleep_timer_ms -= elapsed;
+            }
+        }
+
         /* ── Async cover: create texture when download is done ───── */
         /* SDL textures must be created on the main thread.
            The download thread saves the file and sets g_cover_dl_done. */
@@ -707,7 +794,7 @@ static void screen_main(void) {
             g_cover_dl_done = 0;
             if (g_cover_dl_idx == g_cover_chan_idx) {
                 if (g_cover_tex) { SDL_DestroyTexture(g_cover_tex); g_cover_tex = NULL; }
-                g_cover_tex = ap_load_image("/tmp/soma_cover.png");
+                g_cover_tex   = ap_load_image(g_cover_dl_path);
             }
         }
 
@@ -735,22 +822,26 @@ static void screen_main(void) {
                 case AP_BTN_UP:
                     /* Wrap from first item to last (Endlosscrollen) */
                     g_cursor = (g_cursor > 0) ? g_cursor - 1 : g_channels.count - 1;
+                    g_desc_hide_at = SDL_GetTicks() + 10000;
                     break;
 
                 case AP_BTN_DOWN:
                     /* Wrap from last item to first (Endlosscrollen) */
                     g_cursor = (g_cursor < g_channels.count - 1) ? g_cursor + 1 : 0;
+                    g_desc_hide_at = SDL_GetTicks() + 10000;
                     break;
 
                 case AP_BTN_LEFT:
                     /* Previous station with wrap, and play it immediately */
                     g_cursor = (g_cursor > 0) ? g_cursor - 1 : g_channels.count - 1;
+                    g_desc_hide_at = SDL_GetTicks() + 10000;
                     if (play_channel(g_cursor)) load_cover(g_cursor);
                     break;
 
                 case AP_BTN_RIGHT:
                     /* Next station with wrap, and play it immediately */
                     g_cursor = (g_cursor < g_channels.count - 1) ? g_cursor + 1 : 0;
+                    g_desc_hide_at = SDL_GetTicks() + 10000;
                     if (play_channel(g_cursor)) load_cover(g_cursor);
                     break;
 
@@ -779,6 +870,11 @@ static void screen_main(void) {
                     /* Toggle favourite for the highlighted station */
                     if (g_cursor >= 0 && g_cursor < g_channels.count)
                         favorites_toggle(&g_favorites, g_channels.channels[g_cursor].id);
+                    break;
+
+                case AP_BTN_SELECT:
+                    show_sleep_timer();
+                    screen_activity();
                     break;
 
                 case AP_BTN_B: {
@@ -821,6 +917,39 @@ static void screen_main(void) {
 }
 
 // ----------------------------------------------------------------
+// Sleep timer
+// ----------------------------------------------------------------
+
+static void show_sleep_timer(void) {
+    static const char *labels[] = { "Off", "15 minutes", "30 minutes",
+                                    "60 minutes", "90 minutes" };
+    static const uint32_t values[] = { 0, 15*60000, 30*60000, 60*60000, 90*60000 };
+    int n = 5;
+
+    ap_list_item items[5];
+    char trailing[5][16];
+    for (int i = 0; i < n; i++) {
+        snprintf(trailing[i], sizeof(trailing[i]), "%s",
+                 (g_sleep_timer_ms == values[i]) ? "\xe2\x9c\x93" : "");
+        items[i] = (ap_list_item){ .label = labels[i],
+                                   .trailing_text = trailing[i][0] ? trailing[i] : NULL };
+    }
+
+    ap_footer_item footer[] = {
+        { .button = AP_BTN_B, .label = "Cancel" },
+        { .button = AP_BTN_A, .label = "Set", .is_confirm = true },
+    };
+    ap_list_opts opts = ap_list_default_opts("Sleep Timer", items, n);
+    opts.footer       = footer;
+    opts.footer_count = 2;
+    opts.status_bar   = &g_status_bar;
+
+    ap_list_result result;
+    if (ap_list(&opts, &result) != AP_CANCELLED)
+        g_sleep_timer_ms = values[result.selected_index];
+}
+
+// ----------------------------------------------------------------
 // NextUI screen-timeout integration
 // ----------------------------------------------------------------
 
@@ -828,25 +957,21 @@ static void screen_main(void) {
    Returns the timeout in milliseconds, or 60 000 (60 s) as fallback. */
 static uint32_t load_nextui_timeout(void) {
     /* Try common NextUI settings file locations (key=value format, seconds) */
-    const char *paths[] = {
-        "/mnt/SDCARD/.userdata/shared/settings.txt",
-        "/mnt/SDCARD/.userdata/shared/minui.txt",
-        "/mnt/SDCARD/.userdata/tg5040/settings.txt",
-        "/mnt/SDCARD/.userdata/tg5040/minui.txt",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        FILE *f = fopen(paths[i], "r");
-        if (!f) continue;
+    /* NextUI stores settings in minuisettings.txt, key=value format.
+       screentimeout is in MINUTES (0 = never). */
+    FILE *f = fopen("/mnt/SDCARD/.userdata/shared/minuisettings.txt", "r");
+    if (f) {
         char key[64]; int val;
-        while (fscanf(f, " %63[^=]=%d", key, &val) == 2)
-            if (strcmp(key, "screen_timeout") == 0) {
+        while (fscanf(f, " %63[^=]=%d", key, &val) == 2) {
+            if (strcmp(key, "screentimeout") == 0) {
                 fclose(f);
+                if (val == 0) return 0;              /* 0 = never */
                 return (uint32_t)val * 1000;   /* seconds → milliseconds */
             }
+        }
         fclose(f);
     }
-    return 300000;   /* 5 min fallback — better than accidentally being shorter than NextUI */
+    return 300000;   /* 5 min fallback */
 }
 
 // ----------------------------------------------------------------
@@ -869,20 +994,39 @@ int main(void) {
     player_init();
     favorites_load(&g_favorites);
 
+    /* Build the cache file path once, reused by the background thread */
+    snprintf(g_channels_cache_path, sizeof(g_channels_cache_path),
+             "%s/channels_cache.json", userdata_dir());
+
     /* Enable WiFi silently (auto-proceeds on success, error on failure) */
     if (!ensure_wifi()) goto cleanup;
 
-    /* Fetch the full station list from the SomaFM API */
-    if (!soma_fetch_channels(&g_channels) || g_channels.count == 0) {
-        show_message("Network Error",
-            "Could not load station list.\nCheck your internet connection.");
-        goto cleanup;
+    /* Fast path: load channel list from the on-disk cache written by a
+       previous session.  If the cache is missing or corrupt (first ever
+       launch, or manually deleted), fall back to a synchronous network
+       fetch and write the result as the new cache so future launches
+       are fast.  Either way, a background thread then fetches a fresh
+       copy from the API so the *next* launch sees up-to-date data. */
+    if (!soma_channels_cache_load(g_channels_cache_path, &g_channels)
+        || g_channels.count == 0) {
+        /* First launch or corrupt cache — fetch synchronously */
+        if (!soma_fetch_channels(&g_channels) || g_channels.count == 0) {
+            show_message("Network Error",
+                "Could not load station list.\nCheck your internet connection.");
+            goto cleanup;
+        }
+        /* Persist what we just fetched so the next launch hits the fast path */
+        soma_channels_cache_refresh(g_channels_cache_path);
+    } else {
+        /* Cache loaded — refresh in the background for the next session */
+        start_cache_refresh();
     }
 
-    /* Position the cursor at the last played station (or fall back to station 0) */
+    /* Start at last played station and auto-play it */
     {
         int last = load_last_station();
         g_cursor = (last >= 0 && last < g_channels.count) ? last : 0;
+        play_channel(g_cursor);   /* auto-play on launch */
     }
 
     screen_main();

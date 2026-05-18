@@ -43,6 +43,22 @@ static void save_wifi_setting(int on) {
 }
 
 static int wpa_state_completed(void) {
+    /* Fast path: check sysfs operstate first — avoids forking wpa_cli
+       when the interface is clearly up and associated.  Reading a small
+       sysfs file is a single kernel call (~zero overhead) compared to
+       fork + exec of wpa_cli which costs ~100-200 ms on this hardware. */
+    FILE *sf = fopen("/sys/class/net/wlan0/operstate", "r");
+    if (sf) {
+        char state[16] = {0};
+        fgets(state, sizeof(state), sf);
+        fclose(sf);
+        state[strcspn(state, "\n")] = '\0';
+        if (strcmp(state, "up") == 0) return 1;
+    }
+
+    /* Authoritative check: wpa_cli reports the actual association state.
+       We still need this when sysfs says "unknown" or "dormant" — the
+       interface may be up at the driver level but not yet associated. */
     FILE *p = popen(
         "wpa_cli -p /etc/wifi/sockets -i wlan0 status 2>/dev/null"
         " | grep '^wpa_state=' | cut -d= -f2",

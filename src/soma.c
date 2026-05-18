@@ -45,6 +45,10 @@ static char *http_get(const char *url, long timeout_sec) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+    /* Fail the TCP connect phase quickly (5 s) so a dead server does not
+       hold the thread for the full transfer timeout.  The overall transfer
+       timeout above still caps the total wall-clock time once connected. */
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT,
         "SomaPak/1.0 (NextUI TrimUI; github.com/art1x)");
@@ -80,14 +84,14 @@ void soma_cleanup(void) {
     curl_global_cleanup();
 }
 
-int soma_fetch_channels(SomaChannelList *out) {
+/* Parse a channels.json string (from the API or from a disk cache) into out.
+   Shared by soma_fetch_channels(), soma_channels_cache_load(), and
+   soma_channels_cache_refresh() so the JSON logic lives in exactly one place.
+   Returns 1 if at least one channel was parsed successfully, 0 on any error. */
+static int parse_channels_json(char *json, SomaChannelList *out) {
     out->count = 0;
 
-    char *json = http_get(SOMA_API_URL, 15L);
-    if (!json) return 0;
-
     cJSON *root = cJSON_Parse(json);
-    free(json);
     if (!root) return 0;
 
     cJSON *arr = cJSON_GetObjectItem(root, "channels");
@@ -126,8 +130,14 @@ int soma_fetch_channels(SomaChannelList *out) {
             safe_copy(c->genre,       jgenre->valuestring,  SOMA_GENRE_LEN);
         if (jid    && cJSON_IsString(jid))
             safe_copy(c->id,          jid->valuestring,     SOMA_ID_LEN);
-        if (jlist  && cJSON_IsNumber(jlist))
-            c->listeners = (int)jlist->valuedouble;
+        /* SomaFM API returns listeners as a JSON string (e.g. "129"),
+           not a number — handle both to be safe. */
+        if (jlist) {
+            if (cJSON_IsNumber(jlist))
+                c->listeners = (int)jlist->valuedouble;
+            else if (cJSON_IsString(jlist))
+                c->listeners = atoi(jlist->valuestring);
+        }
         if (jimg   && cJSON_IsString(jimg))
             safe_copy(c->image_url, jimg->valuestring, SOMA_URL_LEN);
 
@@ -177,6 +187,57 @@ int soma_fetch_channels(SomaChannelList *out) {
 
     qsort(out->channels, (size_t)out->count, sizeof(SomaChannel), channel_cmp);
     return count > 0 ? 1 : 0;
+}
+
+int soma_fetch_channels(SomaChannelList *out) {
+    out->count = 0;
+    char *json = http_get(SOMA_API_URL, 15L);
+    if (!json) return 0;
+    int ok = parse_channels_json(json, out);
+    free(json);
+    return ok;
+}
+
+int soma_channels_cache_load(const char *path, SomaChannelList *out) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    /* Read the whole file into a heap buffer so we can pass it to the parser */
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    /* Sanity check: file must be non-empty and at most 1 MB */
+    if (sz <= 0 || sz > 1024 * 1024) { fclose(f); return 0; }
+
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return 0; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    int ok = parse_channels_json(buf, out);
+    free(buf);
+    return ok;
+}
+
+int soma_channels_cache_refresh(const char *path) {
+    /* Fetch a fresh channel list from the API.  We use a slightly shorter
+       timeout than the interactive fetch because this runs in the background
+       and a slow network should not keep the thread alive indefinitely. */
+    char *json = http_get(SOMA_API_URL, 10L);
+    if (!json) return 0;
+
+    /* Parse into a throw-away struct to verify the JSON is valid before
+       overwriting the on-disk cache — we never want to save corrupt data. */
+    SomaChannelList tmp = {0};
+    if (!parse_channels_json(json, &tmp)) { free(json); return 0; }
+
+    FILE *f = fopen(path, "w");
+    if (!f) { free(json); return 0; }
+    fputs(json, f);
+    fclose(f);
+    free(json);
+    return 1;
 }
 
 int soma_fetch_now_playing(const char *channel_id,

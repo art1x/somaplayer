@@ -31,6 +31,15 @@ void soma_cleanup(void);
    Returns 1 on success (out->count > 0), 0 on network or parse error. */
 int soma_fetch_channels(SomaChannelList *out);
 
+/* Load channel list from a local JSON cache file written by a previous run.
+   Returns 1 on success (out->count > 0), 0 if the file is missing or corrupt. */
+int soma_channels_cache_load(const char *path, SomaChannelList *out);
+
+/* Fetch fresh channels from the SomaFM API and overwrite the cache file.
+   Safe to call from a background thread — does NOT touch g_channels.
+   Returns 1 on success (file written), 0 on network or parse error. */
+int soma_channels_cache_refresh(const char *path);
+
 /* Fetch now-playing track for a channel.
    title and artist buffers must each be SOMA_NP_LEN bytes.
    Returns 1 on success, 0 on failure. */
