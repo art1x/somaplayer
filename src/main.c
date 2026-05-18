@@ -567,16 +567,6 @@ static void render_main(void) {
             /* Don't render items that would overlap the footer */
             if (iy + item_h > cont_bot) break;
 
-            /* Highlight bar: cursor = theme highlight, playing (not cursor) = blue tint */
-            if (sel) {
-                ap_color hl = thm->highlight;
-                hl.a = 160;
-                ap_draw_rect(0, iy, cover_x, item_h, hl);
-            } else if (playing) {
-                ap_color play_bg = {180, 150, 10, 150};   /* bright yellow tint */
-                ap_draw_rect(0, iy, cover_x, item_h, play_bg);
-            }
-
             /* Single line: "▶ ★ Station Name  ·  Genre" (ellipsized if too long) */
             char label[192] = "";
             if (playing) strcat(label, MARK_PLAY);
@@ -585,6 +575,24 @@ static void render_main(void) {
             if (ch->genre[0]) {
                 strncat(label, "  \xc2\xb7  ", sizeof(label) - strlen(label) - 1);
                 strncat(label, ch->genre,      sizeof(label) - strlen(label) - 1);
+            }
+
+            /* Measure actual text width (capped at list_maxw for the pill) */
+            int tw       = ap_measure_text(fxsm, label);
+            if (tw > list_maxw) tw = list_maxw;
+            int pill_pad = AP_S(8);
+            int pill_x   = list_pad_x - pill_pad;
+            int pill_w   = tw + 2 * pill_pad;
+            int pill_r   = item_h / 2;   /* fully rounded ends */
+
+            /* Rounded highlight pill, sized to the text */
+            if (sel) {
+                ap_color hl = thm->highlight;
+                hl.a = 200;
+                ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, hl);
+            } else if (playing) {
+                ap_color play_bg = {230, 195, 20, 170};
+                ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, play_bg);
             }
 
             /* Cursor → highlighted_text, playing → accent color, otherwise → text */
