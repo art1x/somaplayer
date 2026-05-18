@@ -24,13 +24,14 @@
 [x] Screen Timeout wird noch nicht der Wert von NExt UI genommen
 [x] Liste wird immernoch von Footer überlappt
 [x] key hint overlay > die beiden Soma Texte untereinander
-[ ] now playing wird jetzt hervorgehoben, aber der Kontrast ist ziemlich schlecht zu erkennen
-[ ] Start button hält stream an spielt ihn aber nicht weiter bei 2. auslöser
-[ ] bitte alle UI elemente auf english (key hint overlay)
-[ ] info in Statusbar kann 2/3 vom Bildschirm breit sein
-[ ] Info in Statusbar endlosscrollen ende/Anfang deutlich kennzeichen ***
-[ ] Screen ging nach 1 min aus obwohl ich in NextUI 2min eingestellt habe
+[x] now playing wird jetzt hervorgehoben, aber der Kontrast ist ziemlich schlecht zu erkennen
+[x] Start button hält stream an spielt ihn aber nicht weiter bei 2. auslöser
+[x] bitte alle UI elemente auf english (key hint overlay)
+[x] info in Statusbar kann 2/3 vom Bildschirm breit sein
+[x] Info in Statusbar endlosscrollen ende/Anfang deutlich kennzeichen ***
+[x] Screen ging nach 1 min aus obwohl ich in NextUI 2min eingestellt habe
+    > Fallback auf 5 min erhöht; liest NextUI settings.txt wenn vorhanden
 
-
-
-
+[ ] Stationsliste nicht abschneiden - genre anzeigen
+[ ] A button in Footer, ganz rechts
+[ ] now playing highlight nicht blau, helles gelb

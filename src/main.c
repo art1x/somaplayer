@@ -544,7 +544,8 @@ static void render_main(void) {
         int list_pad_x = AP_S(12);
         /* Keep list text away from the cover; use the full left portion */
         int list_maxw  = cover_x - AP_S(8);
-        int item_h     = TTF_FontHeight(fxsm) + AP_S(5);
+        int line_h     = TTF_FontHeight(fxsm);
+        int item_h     = line_h * 2 + AP_S(6);  /* title + genre line */
         int visible    = cont_h / item_h;   /* how many items fit on screen */
 
         /* True centred-cursor scroll: cursor is always at position `half`.
@@ -573,11 +574,11 @@ static void render_main(void) {
                 hl.a = 160;
                 ap_draw_rect(0, iy, cover_x, item_h, hl);
             } else if (playing) {
-                ap_color play_bg = {30, 90, 200, 160};
+                ap_color play_bg = {180, 150, 10, 150};   /* bright yellow tint */
                 ap_draw_rect(0, iy, cover_x, item_h, play_bg);
             }
 
-            /* "▶ ★ Station Name" */
+            /* Line 1: "▶ ★ Station Name" */
             char label[128] = "";
             if (playing) strcat(label, MARK_PLAY);
             if (fav)     strcat(label, MARK_STAR);
@@ -588,6 +589,14 @@ static void render_main(void) {
                           playing ? thm->accent            :
                                     thm->text;
             ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
+
+            /* Line 2: genre (dimmer, smaller visual weight) */
+            if (ch->genre[0]) {
+                ap_color gc = thm->hint;
+                ap_draw_text_ellipsized(fxsm, ch->genre,
+                                        list_pad_x + AP_S(4), iy + line_h + AP_S(1),
+                                        gc, list_maxw - AP_S(4));
+            }
         }
     }
 
@@ -597,17 +606,19 @@ static void render_main(void) {
         ap_footer_item footer_play[] = {
             { .button = AP_BTN_B,     .label = "Exit"                        },
             { .button = AP_BTN_X,     .label = "\xe2\x98\x85"                },
-            { .button = AP_BTN_START, .label = "Play", .is_confirm = true    },
+            { .button = AP_BTN_START, .label = "Play/Stop"                   },
+            { .button = AP_BTN_A,     .label = "Select", .is_confirm = true  },
         };
         ap_footer_item footer_stop[] = {
             { .button = AP_BTN_B,     .label = "Exit"                        },
             { .button = AP_BTN_X,     .label = "\xe2\x98\x85"                },
-            { .button = AP_BTN_START, .label = "Stop", .is_confirm = true    },
+            { .button = AP_BTN_START, .label = "Play/Stop"                   },
+            { .button = AP_BTN_A,     .label = "Select", .is_confirm = true  },
         };
         if (g_playing_idx >= 0)
-            ap_draw_footer(footer_stop, 3);
+            ap_draw_footer(footer_stop, 4);
         else
-            ap_draw_footer(footer_play, 3);
+            ap_draw_footer(footer_play, 4);
     }
 }
 
