@@ -436,6 +436,11 @@ static void render_main(void) {
 
     if (g_cover_tex) {
         ap_draw_image(g_cover_tex, cover_x, 0, cover_sz, sh);
+        /* Dim the cover when nothing is playing */
+        if (g_playing_idx < 0) {
+            ap_color dim = {0, 0, 0, 160};
+            ap_draw_rect(cover_x, 0, cover_sz, sh, dim);
+        }
     }
 
     /* ── Gradient: black on left, transparent on right ─────────── */
@@ -468,8 +473,8 @@ static void render_main(void) {
         pthread_mutex_unlock(&g_np_mutex);
 
         if (fxsm && (np_title[0] || np_artist[0])) {
-            /* Build "♪ Artist – Title" (or just one if only one exists) */
-            char np_buf[SOMA_NP_LEN * 2 + 8];
+            /* Build "♪ Artist – Title  ·  1.2k listeners" */
+            char np_buf[SOMA_NP_LEN * 2 + 32];
             if (np_artist[0] && np_title[0])
                 snprintf(np_buf, sizeof(np_buf),
                          "\xe2\x99\xaa %s \xe2\x80\x93 %s", np_artist, np_title);
@@ -477,6 +482,19 @@ static void render_main(void) {
                 snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_artist);
             else
                 snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_title);
+
+            /* Append listener count if available */
+            if (g_playing_idx >= 0) {
+                int lc = g_channels.channels[g_playing_idx].listeners;
+                if (lc > 0) {
+                    char lbuf[24];
+                    if (lc >= 1000)
+                        snprintf(lbuf, sizeof(lbuf), "  \xc2\xb7  %.1fk", lc / 1000.0);
+                    else
+                        snprintf(lbuf, sizeof(lbuf), "  \xc2\xb7  %d", lc);
+                    strncat(np_buf, lbuf, sizeof(np_buf) - strlen(np_buf) - 1);
+                }
+            }
 
             int text_w = ap_measure_text(fxsm, np_buf);
             int text_h = TTF_FontHeight(fxsm);
@@ -492,9 +510,12 @@ static void render_main(void) {
             ap_color np_bg = {40, 40, 40, 180};
             ap_color np_fg = {220, 220, 220, 255};
 
+            int pill_h = text_h + pad;
+            int pill_r = pill_h / 2;   /* fully rounded pill shape */
+
             if (text_w <= pill_maxw) {
-                /* Text fits: draw static pill */
-                ap_draw_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, text_h + pad, np_bg);
+                /* Text fits: draw static rounded pill */
+                ap_draw_rounded_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, pill_h, pill_r, np_bg);
                 ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
             } else {
                 /* Text too long: draw scrolling ticker with SDL clip rect */
@@ -508,7 +529,7 @@ static void render_main(void) {
                 if (g_ticker_ms > 2000)
                     g_ticker_px = (int)((g_ticker_ms - 2000) * 60 / 1000);
 
-                ap_draw_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, text_h + pad, np_bg);
+                ap_draw_rounded_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, pill_h, pill_r, np_bg);
 
                 /* Draw text + "   ***   " separator + text again for seamless loop.
                    The clip rect hides anything outside the pill area. */
@@ -587,19 +608,51 @@ static void render_main(void) {
 
             /* Rounded highlight pill, sized to the text */
             if (sel) {
-                ap_color hl = thm->highlight;
-                hl.a = 200;
-                ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, hl);
+                ap_color white = {255, 255, 255, 230};
+                ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, white);
             } else if (playing) {
                 ap_color play_bg = {230, 195, 20, 170};
                 ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, play_bg);
             }
 
-            /* Cursor → highlighted_text, playing → accent color, otherwise → text */
-            ap_color tc = sel     ? thm->highlighted_text :
-                          playing ? thm->accent            :
+            /* Cursor → black on white, playing → dark on yellow, otherwise → text */
+            ap_color tc = sel     ? (ap_color){0,   0,   0,   255} :
+                          playing ? (ap_color){30,  20,  0,   255} :
                                     thm->text;
             ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
+
+            /* LIVE badge: small red pill after the text of the playing station */
+            if (playing && fxsm) {
+                int lw = ap_measure_text(fxsm, "LIVE");
+                int lh = TTF_FontHeight(fxsm);
+                int lp = AP_S(5);
+                int lx = pill_x + pill_w + AP_S(6);
+                int ly = iy + (item_h - lh) / 2;
+                /* Only draw if it fits on screen */
+                if (lx + lw + 2 * lp <= sw) {
+                    ap_color live_bg = {200, 30, 30, 220};
+                    ap_color live_fg = {255, 255, 255, 255};
+                    ap_draw_rounded_rect(lx, ly - lp / 2, lw + 2 * lp, lh + lp, lh / 2, live_bg);
+                    ap_draw_text(fxsm, "LIVE", lx + lp, ly, live_fg);
+                }
+            }
+        }
+
+        /* ── List vignette: fade top and bottom items into black ── */
+        {
+            int vign_h = item_h * 2;
+            int steps  = 16;
+            for (int i = 0; i < steps; i++) {
+                Uint8 a = (Uint8)(200 - (200 * i / (steps - 1)));
+                ap_color c = {0, 0, 0, a};
+                /* Top */
+                ap_draw_rect(0, cont_top + vign_h * i / steps,
+                             sw, vign_h / steps + 1, c);
+                /* Bottom */
+                ap_draw_rect(0, cont_bot - vign_h + vign_h * i / steps,
+                             sw, vign_h / steps + 1,
+                             (ap_color){0, 0, 0, 200 - (Uint8)a});
+            }
         }
     }
 
