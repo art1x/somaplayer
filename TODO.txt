@@ -18,8 +18,9 @@
 [x] cover in besserer auflösung verfügbar?
 [x] Start in Footer Mitte
 [x] A Button nur zum auswählen/starten
-[ ] Start button > nur play/stop für aktuellen song nicht neue auswahl abspielen
-[ ] Liste soll nicht bis in den Footer hineinragen
-[ ] würde es gehen das der Cursor immer in der Mitte stehen bleibt, die Liste scrollt quasie?
-[ ] 
-
+[x] Start button > nur play/stop für aktuellen song nicht neue auswahl abspielen
+[x] Liste soll nicht bis in den Footer hineinragen
+[x] würde es gehen das der Cursor immer in der Mitte stehen bleibt, die Liste scrollt quasie?
+[ ] Screen Timeout wird noch nicht der Wert von NExt UI genommen
+[ ] Liste wird immernoch von Footer überlappt
+[ ] key hint overlay > die beiden Soma Texte untereinander

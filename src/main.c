@@ -50,9 +50,17 @@ static ap_status_bar_opts g_status_bar = {
     .show_wifi    = true,
 };
 
-/* Cover art – synchronously loaded when a station starts playing */
-static SDL_Texture *g_cover_tex      = NULL;
-static int          g_cover_chan_idx = -2;   /* -2 = nothing loaded yet */
+/* Cover art – downloaded in a background thread; texture created in main thread */
+static SDL_Texture  *g_cover_tex      = NULL;
+static int           g_cover_chan_idx = -2;   /* channel whose cover is displayed */
+static volatile int  g_cover_loading  = 0;    /* download in progress */
+static volatile int  g_cover_dl_done  = 0;    /* file saved, needs texture creation */
+static          int  g_cover_dl_idx   = -1;   /* channel that was just downloaded */
+
+/* Now-playing ticker scroll state */
+static uint32_t g_ticker_ms   = 0;
+static int      g_ticker_px   = 0;
+static char     g_ticker_last[SOMA_NP_LEN * 2 + 8] = "";
 
 /* Now-playing metadata written by a background pthread, read on every frame */
 static volatile int    g_np_running  = 0;
@@ -157,22 +165,23 @@ static size_t cover_write_cb(void *ptr, size_t size, size_t nmemb, FILE *fp) {
     return fwrite(ptr, size, nmemb, fp);
 }
 
-/* Download the cover art for channel chan_idx to /tmp/soma_cover.png
-   and load it as an SDL texture.  Does nothing if that channel's cover
-   is already loaded (g_cover_chan_idx tracks the cache). */
-static void load_cover(int chan_idx) {
-    if (chan_idx == g_cover_chan_idx) return;   /* already cached */
-    if (g_cover_tex) { SDL_DestroyTexture(g_cover_tex); g_cover_tex = NULL; }
-    g_cover_chan_idx = chan_idx;
+/* Background thread: downloads the cover image to /tmp/soma_cover.png.
+   Sets g_cover_dl_done when finished so the main thread can create the texture.
+   SDL textures MUST be created on the main thread — the thread only saves the file. */
+typedef struct { int idx; char url[SOMA_URL_LEN]; } CoverDlArg;
 
-    const char *url = g_channels.channels[chan_idx].image_url;
-    if (!url[0]) return;
+static void *cover_dl_thread(void *arg) {
+    CoverDlArg *a = arg;
+    int  idx = a->idx;
+    char url[SOMA_URL_LEN];
+    memcpy(url, a->url, SOMA_URL_LEN);
+    free(a);
 
     const char *tmp = "/tmp/soma_cover.png";
     CURL *curl = curl_easy_init();
-    if (!curl) return;
+    if (!curl) { g_cover_loading = 0; return NULL; }
     FILE *fp = fopen(tmp, "wb");
-    if (!fp) { curl_easy_cleanup(curl); return; }
+    if (!fp) { curl_easy_cleanup(curl); g_cover_loading = 0; return NULL; }
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, cover_write_cb);
@@ -180,15 +189,44 @@ static void load_cover(int chan_idx) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 #ifdef PLATFORM_TG5040
-    /* On-device TLS bundle bundled next to the binary */
     curl_easy_setopt(curl, CURLOPT_CAINFO, "./cacert.pem");
 #endif
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     fclose(fp);
 
-    if (res == CURLE_OK)
-        g_cover_tex = ap_load_image(tmp);
+    if (res == CURLE_OK) {
+        /* Signal main thread to create the texture */
+        g_cover_dl_idx  = idx;
+        g_cover_dl_done = 1;
+    }
+    g_cover_loading = 0;
+    return NULL;
+}
+
+/* Start an async cover art download for channel chan_idx.
+   The texture is created on the main thread when g_cover_dl_done is set. */
+static void load_cover(int chan_idx) {
+    if (chan_idx == g_cover_chan_idx && !g_cover_loading) return;  /* already have it */
+    if (g_cover_loading) return;   /* another download is already running */
+
+    /* Clear the current texture immediately so the screen shows no stale art */
+    if (g_cover_tex) { SDL_DestroyTexture(g_cover_tex); g_cover_tex = NULL; }
+    g_cover_chan_idx = chan_idx;
+    g_cover_dl_done  = 0;
+
+    const char *url = g_channels.channels[chan_idx].image_url;
+    if (!url[0]) return;   /* channel has no artwork URL */
+
+    CoverDlArg *arg = malloc(sizeof(CoverDlArg));
+    if (!arg) return;
+    arg->idx = chan_idx;
+    memcpy(arg->url, url, SOMA_URL_LEN);
+
+    g_cover_loading = 1;
+    pthread_t t;
+    pthread_create(&t, NULL, cover_dl_thread, arg);
+    pthread_detach(t);
 }
 
 // ----------------------------------------------------------------
@@ -335,20 +373,27 @@ static void render_key_hint_overlay(void) {
     };
     int hint_count = 6;
 
-    /* Measure the total block height so we can centre it vertically */
-    int title_h = flg ? TTF_FontHeight(flg) + AP_S(20) : AP_S(36);
+    /* Layout: heading + URL together at top, then gap, then key hints */
+    int title_h = flg ? TTF_FontHeight(flg) + AP_S(6)  : AP_S(30);
+    int url_h   = fsm ? TTF_FontHeight(fsm) + AP_S(20) : AP_S(28);  /* gap after URL */
     int line_h  = fsm ? TTF_FontHeight(fsm) + AP_S(10) : AP_S(28);
-    int url_h   = fsm ? TTF_FontHeight(fsm) + AP_S(14) : AP_S(22);
-    int total_h = title_h + hint_count * line_h + url_h;
+    int total_h = title_h + url_h + hint_count * line_h;
 
     int y     = (sh - total_h) / 2;
     int pad_x = AP_S(80);
 
-    /* Heading: "Support SomaFM ♥" */
+    /* "Support SomaFM ♥" */
     if (flg) {
         ap_color yellow = {255, 220, 60, 255};
         ap_draw_text(flg, "Support SomaFM \xe2\x99\xa5", pad_x, y, yellow);
         y += title_h;
+    }
+
+    /* "somafm.com/support/" directly below heading */
+    if (fsm) {
+        ap_color grey = {140, 140, 140, 255};
+        ap_draw_text(fsm, "somafm.com/support/", pad_x, y, grey);
+        y += url_h;   /* includes the gap before hints */
     }
 
     /* Key hints */
@@ -356,13 +401,6 @@ static void render_key_hint_overlay(void) {
     for (int i = 0; i < hint_count; i++) {
         if (fsm) ap_draw_text(fsm, hints[i], pad_x, y, hint_col);
         y += line_h;
-    }
-
-    /* Donation URL */
-    if (fsm) {
-        ap_color grey = {140, 140, 140, 255};
-        y += AP_S(4);
-        ap_draw_text(fsm, "somafm.com/support/", pad_x, y, grey);
     }
 }
 
@@ -377,7 +415,7 @@ static void render_main(void) {
     int sw   = ap_get_screen_width();
     int sh   = ap_get_screen_height();
     int sb_h = ap_get_status_bar_height();
-    int ft_h = AP_S(44);                /* footer height */
+    int ft_h = ap_get_footer_height();  /* exact height from Apostrophe */
     int cont_top = sb_h;
     int cont_bot = sh  - ft_h;
     int cont_h   = cont_bot - cont_top;
@@ -443,15 +481,46 @@ static void render_main(void) {
             int text_h = TTF_FontHeight(fxsm);
 
             /* Left-align the pill, vertically centred in the status bar */
-            int tx = AP_S(12);
-            int ty = (sb_h - text_h) / 2;
-
+            int tx  = AP_S(12);
+            int ty  = (sb_h - text_h) / 2;
             int pad = AP_S(6);
-            ap_color np_bg = {40, 40, 40, 180};
-            ap_draw_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, text_h + pad, np_bg);
 
+            /* Limit pill width to half the screen so battery/clock stay visible */
+            int pill_maxw = sw / 2 - AP_S(8);
+
+            ap_color np_bg = {40, 40, 40, 180};
             ap_color np_fg = {220, 220, 220, 255};
-            ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
+
+            if (text_w <= pill_maxw) {
+                /* Text fits: draw static pill */
+                ap_draw_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, text_h + pad, np_bg);
+                ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
+            } else {
+                /* Text too long: draw scrolling ticker with SDL clip rect */
+                /* Reset scroll when text changes */
+                if (strcmp(np_buf, g_ticker_last) != 0) {
+                    strncpy(g_ticker_last, np_buf, sizeof(g_ticker_last) - 1);
+                    g_ticker_px = 0;
+                    g_ticker_ms = 0;
+                }
+                /* 2 s pause at start, then scroll at 60 px/s */
+                if (g_ticker_ms > 2000)
+                    g_ticker_px = (int)((g_ticker_ms - 2000) * 60 / 1000);
+                /* Loop back after full scroll */
+                if (g_ticker_px > text_w + AP_S(20)) {
+                    g_ticker_ms = 0;
+                    g_ticker_px = 0;
+                }
+
+                ap_draw_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, text_h + pad, np_bg);
+
+                /* Clip to the pill area before drawing the scrolled text */
+                SDL_Renderer *rend = ap_get_renderer();
+                SDL_Rect clip = { tx - pad, 0, pill_maxw + 2 * pad, sb_h };
+                SDL_RenderSetClipRect(rend, &clip);
+                ap_draw_text(fxsm, np_buf, tx - g_ticker_px, ty, np_fg);
+                SDL_RenderSetClipRect(rend, NULL);
+            }
         }
     }
 
@@ -483,11 +552,14 @@ static void render_main(void) {
             /* Don't render items that would overlap the footer */
             if (iy + item_h > cont_bot) break;
 
-            /* Highlight bar behind the selected item */
+            /* Highlight bar: cursor = theme highlight, playing (not cursor) = blue tint */
             if (sel) {
                 ap_color hl = thm->highlight;
-                hl.a = 160;   /* semi-transparent so gradient shows through */
+                hl.a = 160;
                 ap_draw_rect(0, iy, cover_x, item_h, hl);
+            } else if (playing) {
+                ap_color play_bg = {20, 60, 120, 100};
+                ap_draw_rect(0, iy, cover_x, item_h, play_bg);
             }
 
             /* "▶ ★ Station Name" */
@@ -496,7 +568,10 @@ static void render_main(void) {
             if (fav)     strcat(label, MARK_STAR);
             strncat(label, ch->title, sizeof(label) - strlen(label) - 1);
 
-            ap_color tc = sel ? thm->highlighted_text : thm->text;
+            /* Cursor → highlighted_text, playing → accent color, otherwise → text */
+            ap_color tc = sel     ? thm->highlighted_text :
+                          playing ? thm->accent            :
+                                    thm->text;
             ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
         }
     }
@@ -536,8 +611,23 @@ static void screen_main(void) {
     while (1) {
         /* ── Screen timeout timer ────────────────────────────────── */
         uint32_t now_ticks = SDL_GetTicks();
-        screen_update(now_ticks - last_ticks);
+        uint32_t elapsed   = now_ticks - last_ticks;
+        screen_update(elapsed);
         last_ticks = now_ticks;
+
+        /* ── Ticker time ─────────────────────────────────────────── */
+        if (!screen_is_off()) g_ticker_ms += elapsed;
+
+        /* ── Async cover: create texture when download is done ───── */
+        /* SDL textures must be created on the main thread.
+           The download thread saves the file and sets g_cover_dl_done. */
+        if (g_cover_dl_done) {
+            g_cover_dl_done = 0;
+            if (g_cover_dl_idx == g_cover_chan_idx) {
+                if (g_cover_tex) { SDL_DestroyTexture(g_cover_tex); g_cover_tex = NULL; }
+                g_cover_tex = ap_load_image("/tmp/soma_cover.png");
+            }
+        }
 
         /* ── Input ────────────────────────────────────────────────── */
         ap_input_event ev;
@@ -643,6 +733,32 @@ static void screen_main(void) {
 }
 
 // ----------------------------------------------------------------
+// NextUI screen-timeout integration
+// ----------------------------------------------------------------
+
+/* Try to read the screen timeout from known NextUI settings locations.
+   Returns the timeout in milliseconds, or 60 000 (60 s) as fallback. */
+static uint32_t load_nextui_timeout(void) {
+    const char *paths[] = {
+        "/mnt/SDCARD/.userdata/shared/settings.txt",
+        "/mnt/SDCARD/.userdata/tg5040/settings.txt",
+        NULL
+    };
+    for (int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        char key[64]; int val;
+        while (fscanf(f, " %63[^=]=%d", key, &val) == 2)
+            if (strcmp(key, "screen_timeout") == 0) {
+                fclose(f);
+                return (uint32_t)val * 1000;   /* seconds → milliseconds */
+            }
+        fclose(f);
+    }
+    return 60000;   /* 60 s fallback */
+}
+
+// ----------------------------------------------------------------
 // main
 // ----------------------------------------------------------------
 int main(void) {
@@ -654,6 +770,7 @@ int main(void) {
     };
     if (ap_init(&cfg) != AP_OK) return 1;
     ap_set_power_handler(false);   /* we manage the power button ourselves in screen.c */
+    screen_set_timeout(load_nextui_timeout());
     screen_init();
     screen_init_power();
 
