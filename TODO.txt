@@ -1,1 +1,13 @@
-[x] keine Hintergrund-Wiedergabe
+- ich möchte es noch weiter vereinfachen, es gibt nur noch einen Screen
+  > Basierend auf den Player Screen
+- Cover in voller höhe am rechten Bildschirmrand ausgerichtet
+  > Verläuft nach links ins Schwarze
+- Stations Liste am linken Rand, kleinere Schrift
+- Info was gerade Spielt kommt in die Statusleiste mit Grau transparentem Hintergrund
+- Stationsname muss nicht mehr extra angezeigt werden
+- Overlay weiterhin auf menubutton (spenden hinweis)
+- A, Start > Play/Stop
+- beim beenden nachfragen
+- hoch runter navigiert Stationsliste
+- X > Fovoriten toggle
+- Wifi Screen, kein ok, automatisch aktivieren und wenn aktiviert ausblenden, wenn fehlgeschlagen, meldung 'connect to wifi'

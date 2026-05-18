@@ -1,22 +1,20 @@
 // ================================================================
 // main.c  –  SomaFM Radio Player for TrimUI / NextUI
 //
-// Main menu:
-//   Stations   – all channels, X = toggle favorite
-//   Favorites  – saved favorites, X = remove
+// Single-screen UI:
+//   Left:       scrollable station list
+//   Right:      cover art, full content height, right-aligned,
+//               fades to black on the left side
+//   Status bar: now-playing info (artist – title) centred with a
+//               semi-transparent grey background pill
 //
-// Controls (both lists):
-//   ↑ / ↓      → Navigate
-//   A           → Play / Now Playing
-//   X           → Toggle / Remove favorite
-//   Y           → Stop playback (only when playing)
-//   MENU        → Settings (screen timeout)
-//   B / MENU    → Back / Exit
-//
-// Controls (Now Playing):
-//   A           → Stop
-//   B           → Back to list (music keeps playing)
-//   SELECT + A  → Wake screen (when screen is off)
+// Controls:
+//   ↑ / ↓      → Navigate station list
+//   A / START  → Play selected station / Stop playback
+//   X          → Toggle favorite ★ for highlighted station
+//   MENU (hold)→ Show key-hint overlay with SomaFM support info
+//   B          → Ask before exit
+//   Power      → Toggle screen on/off (audio continues)
 // ================================================================
 
 #define AP_IMPLEMENTATION
@@ -28,6 +26,7 @@
 #include "player.h"
 #include "wifi.h"
 #include "favorites.h"
+#include "screen.h"
 
 #include <curl/curl.h>
 
@@ -38,115 +37,12 @@
 #include <pthread.h>
 
 // ----------------------------------------------------------------
-// Screen-state constants (used in the Now Playing loop)
-// ----------------------------------------------------------------
-#define SCREEN_ON   0
-#define SCREEN_OFF  1
-#define SCREEN_HINT 2   /* "Select+A" hint shown for 1 s */
-
-// ----------------------------------------------------------------
-// Backlight control – TG5040 only
-// Identical to nexttimer implementation.
-// ----------------------------------------------------------------
-#ifdef PLATFORM_TG5040
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-
-#define DISP_LCD_SET_BRIGHTNESS 0x102
-#define SHM_KEY "/SharedSettings"
-
-typedef struct { int version; int brightness; } MinSettings;
-
-static void backlight_raw(int val) {
-    int fd = open("/dev/disp", O_RDWR);
-    if (fd >= 0) {
-        unsigned long param[4] = {0, (unsigned long)val, 0, 0};
-        ioctl(fd, DISP_LCD_SET_BRIGHTNESS, &param);
-        close(fd);
-    }
-}
-
-static int backlight_read_level(void) {
-    int fd = shm_open(SHM_KEY, O_RDWR, 0644);
-    if (fd < 0) return 7;
-    MinSettings *s = mmap(NULL, sizeof(MinSettings),
-                          PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (s == MAP_FAILED) return 7;
-    int level = s->brightness;
-    munmap(s, sizeof(MinSettings));
-    return (level >= 0 && level <= 10) ? level : 7;
-}
-
-static void backlight_off(void) { backlight_raw(0); }
-static void backlight_on(void) {
-    static const int tbl[11] = {1,8,16,32,48,72,96,128,160,192,255};
-    int level = backlight_read_level();
-    backlight_raw(8);
-    backlight_raw(tbl[level]);
-}
-#endif /* PLATFORM_TG5040 */
-
-// ----------------------------------------------------------------
-// Settings
-// ----------------------------------------------------------------
-typedef struct {
-    int screen_timeout;   /* seconds; 0 = never */
-} Settings;
-
-/* Shared userdata directory: $SHARED_USERDATA_PATH/somaplayer/ */
-static const char *userdata_dir(void) {
-    static char dir[256];
-    if (dir[0]) return dir;
-    const char *base = getenv("SHARED_USERDATA_PATH");
-    if (!base || !base[0]) base = "/mnt/SDCARD/.userdata/shared";
-    snprintf(dir, sizeof(dir), "%s/somaplayer", base);
-    return dir;   /* favorites.c already calls mkdir; no need to repeat here */
-}
-
-static void settings_init(Settings *s) {
-    s->screen_timeout = 60;
-}
-
-static void settings_load(Settings *s) {
-    settings_init(s);
-    char path[280];
-    snprintf(path, sizeof(path), "%s/settings.txt", userdata_dir());
-    FILE *f = fopen(path, "r");
-    if (!f) return;
-    char key[32]; int val;
-    while (fscanf(f, " %31[^=]=%d", key, &val) == 2)
-        if (strcmp(key, "screen_timeout") == 0) s->screen_timeout = val;
-    fclose(f);
-}
-
-static void settings_save(const Settings *s) {
-    char path[280];
-    snprintf(path, sizeof(path), "%s/settings.txt", userdata_dir());
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "screen_timeout=%d\n", s->screen_timeout);
-    fclose(f);
-}
-
-// ----------------------------------------------------------------
-// Screen-timeout helpers
-// ----------------------------------------------------------------
-static const int   TIMEOUT_VALS[]   = {0, 10, 30, 60, 120, 300};
-static const char *TIMEOUT_LABELS[] = {"Never","10 sec","30 sec",
-                                        "1 min","2 min","5 min"};
-#define TIMEOUT_COUNT 6
-
-
-
-// ----------------------------------------------------------------
 // Global state
 // ----------------------------------------------------------------
 static SomaChannelList g_channels    = {0};
-static int             g_playing_idx = -1;
+static int             g_playing_idx = -1;   /* index of playing channel, -1 = stopped */
+static int             g_cursor      = 0;    /* highlighted station in the list */
 static FavoriteList    g_favorites   = {0};
-static Settings        g_settings;
 
 static ap_status_bar_opts g_status_bar = {
     .show_clock   = AP_CLOCK_AUTO,
@@ -154,28 +50,56 @@ static ap_status_bar_opts g_status_bar = {
     .show_wifi    = true,
 };
 
-/* Cover art */
-static SDL_Texture *g_cover_tex       = NULL;
-static int          g_cover_chan_idx  = -2;  /* -2 = none loaded */
+/* Cover art – synchronously loaded when a station starts playing */
+static SDL_Texture *g_cover_tex      = NULL;
+static int          g_cover_chan_idx = -2;   /* -2 = nothing loaded yet */
 
-/* Now-playing metadata (background polling thread) */
+/* Now-playing metadata written by a background pthread, read on every frame */
 static volatile int    g_np_running  = 0;
 static pthread_mutex_t g_np_mutex    = PTHREAD_MUTEX_INITIALIZER;
 static char            g_np_title[SOMA_NP_LEN]  = "";
 static char            g_np_artist[SOMA_NP_LEN] = "";
 static int             g_np_for_idx = -1;
 
+/* UTF-8 strings used as list decorators */
+#define MARK_PLAY "\xe2\x96\xb6 "   /* ▶  (U+25B6) */
+#define MARK_STAR "\xe2\x98\x85 "   /* ★  (U+2605) */
+
+// ----------------------------------------------------------------
+// Userdata directory
+// ----------------------------------------------------------------
+
+/* Returns the path to $SHARED_USERDATA_PATH/somaplayer/.
+   The result is cached after the first call. */
+static const char *userdata_dir(void) {
+    static char dir[256];
+    if (dir[0]) return dir;
+    const char *base = getenv("SHARED_USERDATA_PATH");
+    if (!base || !base[0]) base = "/mnt/SDCARD/.userdata/shared";
+    snprintf(dir, sizeof(dir), "%s/somaplayer", base);
+    return dir;   /* favorites.c already creates this directory */
+}
+
+// ----------------------------------------------------------------
+// Now-playing background thread
+// ----------------------------------------------------------------
+
+/* Polls the SomaFM songs API every 30 seconds and writes the result
+   into g_np_title / g_np_artist, protected by g_np_mutex. */
 static void *np_poll_thread(void *arg) {
     (void)arg;
     int first = 1;
     while (g_np_running) {
         if (!first) {
+            /* Wait 30 seconds between polls, checking the running flag each second
+               so the thread stops promptly when playback ends. */
             for (int i = 0; i < 30 && g_np_running; i++)
                 sleep(1);
         }
         first = 0;
         if (!g_np_running) break;
 
+        /* Read which channel we should poll (may change if the user switches) */
         pthread_mutex_lock(&g_np_mutex);
         int idx = g_np_for_idx;
         pthread_mutex_unlock(&g_np_mutex);
@@ -186,6 +110,7 @@ static void *np_poll_thread(void *arg) {
         char artist[SOMA_NP_LEN] = "";
         soma_fetch_now_playing(g_channels.channels[idx].id, title, artist);
 
+        /* Only store the result if the channel hasn't changed while we were fetching */
         pthread_mutex_lock(&g_np_mutex);
         if (g_np_for_idx == idx) {
             memcpy(g_np_title,  title,  SOMA_NP_LEN);
@@ -196,9 +121,11 @@ static void *np_poll_thread(void *arg) {
     return NULL;
 }
 
+/* Start polling now-playing metadata for channel chan_idx.
+   If the thread is already running it keeps running; only the target channel changes. */
 static void np_start(int chan_idx) {
     pthread_mutex_lock(&g_np_mutex);
-    g_np_for_idx = chan_idx;
+    g_np_for_idx   = chan_idx;
     g_np_title[0]  = '\0';
     g_np_artist[0] = '\0';
     pthread_mutex_unlock(&g_np_mutex);
@@ -207,10 +134,11 @@ static void np_start(int chan_idx) {
         g_np_running = 1;
         pthread_t t;
         pthread_create(&t, NULL, np_poll_thread, NULL);
-        pthread_detach(t);
+        pthread_detach(t);   /* we never join this thread; it exits when g_np_running = 0 */
     }
 }
 
+/* Signal the polling thread to stop and clear cached metadata. */
 static void np_stop(void) {
     g_np_running = 0;
     pthread_mutex_lock(&g_np_mutex);
@@ -220,22 +148,20 @@ static void np_stop(void) {
     pthread_mutex_unlock(&g_np_mutex);
 }
 
-/* UTF-8 literals used in trailing text / labels */
-#define MARK_PLAY "\xe2\x96\xb6 "   /* ▶  */
-#define MARK_STAR "\xe2\x98\x85 "   /* ★  */
-
-// ----------------------------------------------------------------
-// Helper: simple info / error message
-// ----------------------------------------------------------------
 // ----------------------------------------------------------------
 // Cover art download + cache
 // ----------------------------------------------------------------
+
+/* libcurl write callback: writes downloaded bytes straight to a FILE* */
 static size_t cover_write_cb(void *ptr, size_t size, size_t nmemb, FILE *fp) {
     return fwrite(ptr, size, nmemb, fp);
 }
 
+/* Download the cover art for channel chan_idx to /tmp/soma_cover.png
+   and load it as an SDL texture.  Does nothing if that channel's cover
+   is already loaded (g_cover_chan_idx tracks the cache). */
 static void load_cover(int chan_idx) {
-    if (chan_idx == g_cover_chan_idx) return;
+    if (chan_idx == g_cover_chan_idx) return;   /* already cached */
     if (g_cover_tex) { SDL_DestroyTexture(g_cover_tex); g_cover_tex = NULL; }
     g_cover_chan_idx = chan_idx;
 
@@ -254,6 +180,7 @@ static void load_cover(int chan_idx) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 #ifdef PLATFORM_TG5040
+    /* On-device TLS bundle bundled next to the binary */
     curl_easy_setopt(curl, CURLOPT_CAINFO, "./cacert.pem");
 #endif
     CURLcode res = curl_easy_perform(curl);
@@ -264,6 +191,8 @@ static void load_cover(int chan_idx) {
         g_cover_tex = ap_load_image(tmp);
 }
 
+// ----------------------------------------------------------------
+// Simple info / error dialog
 // ----------------------------------------------------------------
 static void show_message(const char *title, const char *body) {
     ap_footer_item footer[] = {
@@ -280,9 +209,44 @@ static void show_message(const char *title, const char *body) {
 }
 
 // ----------------------------------------------------------------
-// Helper: start playback for channel idx.
-// Returns 1 on success, 0 on error (message already shown).
+// Last-played station persistence
 // ----------------------------------------------------------------
+
+/* Save the channel ID of chan_idx to last_station.txt so the next
+   launch can restore the cursor to the same station. */
+static void save_last_station(int chan_idx) {
+    if (chan_idx < 0 || chan_idx >= g_channels.count) return;
+    char path[280];
+    snprintf(path, sizeof(path), "%s/last_station.txt", userdata_dir());
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", g_channels.channels[chan_idx].id);
+    fclose(f);
+}
+
+/* Read last_station.txt and find the corresponding index in g_channels.
+   Returns -1 if the file doesn't exist or the ID is not in the list. */
+static int load_last_station(void) {
+    char path[280];
+    snprintf(path, sizeof(path), "%s/last_station.txt", userdata_dir());
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char id[64] = "";
+    fscanf(f, " %63s", id);
+    fclose(f);
+    if (!id[0]) return -1;
+    for (int i = 0; i < g_channels.count; i++)
+        if (strcmp(g_channels.channels[i].id, id) == 0)
+            return i;
+    return -1;   /* station no longer in the API response */
+}
+
+// ----------------------------------------------------------------
+// Playback helper
+// ----------------------------------------------------------------
+
+/* Stop whatever is playing, start channel idx, wait briefly to detect
+   immediate errors.  Returns 1 on success, 0 on error (already shown). */
 static int play_channel(int idx) {
     player_stop();
     np_stop();
@@ -299,589 +263,326 @@ static int play_channel(int idx) {
     }
     g_playing_idx = idx;
     np_start(idx);
+    save_last_station(idx);   /* persist so next launch resumes here */
     return 1;
 }
 
 // ----------------------------------------------------------------
-// Settings screen (opened by MENU button)
+// Render helpers
 // ----------------------------------------------------------------
-// ----------------------------------------------------------------
-// Settings – ap_options_list widget
-// Opened from custom loops (main menu, now playing) so MENU works.
-// ----------------------------------------------------------------
-static void screen_settings(void) {
-    ap_option timeout_opts[TIMEOUT_COUNT];
-    int cur_sel = 0;
-    for (int i = 0; i < TIMEOUT_COUNT; i++) {
-        timeout_opts[i].label = TIMEOUT_LABELS[i];
-        timeout_opts[i].value = TIMEOUT_LABELS[i];
-        if (TIMEOUT_VALS[i] == g_settings.screen_timeout) cur_sel = i;
-    }
 
-    ap_options_item items[] = {
-        {
-            .label           = "Screen Timeout",
-            .type            = AP_OPT_STANDARD,
-            .options         = timeout_opts,
-            .option_count    = TIMEOUT_COUNT,
-            .selected_option = cur_sel,
-        },
-        {
-            .label        = "Support SomaFM \xe2\x99\xa5",
-            .type         = AP_OPT_STANDARD,
-            .option_count = 0,
-        },
-        {
-            .label        = "  somafm.com/support/",
-            .type         = AP_OPT_STANDARD,
-            .option_count = 0,
-        },
-    };
-
-    ap_footer_item footer[] = {
-        { .button = AP_BTN_B, .label = "Back" },
-    };
-
-    ap_options_list_opts opts = {
-        .title        = "Settings",
-        .items        = items,
-        .item_count   = 3,
-        .footer       = footer,
-        .footer_count = 1,
-        .status_bar   = &g_status_bar,
-    };
-
-    ap_options_list_result result;
-    ap_options_list(&opts, &result);
-
-    g_settings.screen_timeout = TIMEOUT_VALS[items[0].selected_option];
-    settings_save(&g_settings);
-}
-
-// ----------------------------------------------------------------
-// Now Playing – custom render helpers
-// ----------------------------------------------------------------
-static void render_screen_off(int show_hint) {
-    int      sw  = ap_get_screen_width();
-    int      sh  = ap_get_screen_height();
+/* Solid black frame – shown while the screen timeout has blanked the display */
+static void render_screen_off(void) {
     ap_color blk = {0, 0, 0, 255};
-    ap_draw_rect(0, 0, sw, sh, blk);
-
-    if (show_hint) {
-        ap_theme  *thm  = ap_get_theme();
-        TTF_Font  *fmed = ap_get_font(AP_FONT_MEDIUM);
-        TTF_Font  *fsm  = ap_get_font(AP_FONT_SMALL);
-        if (fmed) {
-            const char *l1 = "Press Select + A";
-            ap_draw_text(fmed, l1,
-                (sw - ap_measure_text(fmed, l1)) / 2,
-                sh / 2 - TTF_FontHeight(fmed) - AP_S(4), thm->text);
-        }
-        if (fsm) {
-            const char *l2 = "to wake the screen";
-            ap_draw_text(fsm, l2,
-                (sw - ap_measure_text(fsm, l2)) / 2,
-                sh / 2 + AP_S(4), thm->hint);
-        }
-    }
+    ap_draw_rect(0, 0, ap_get_screen_width(), ap_get_screen_height(), blk);
     ap_present();
 }
 
-static void render_now_playing(int idx) {
-    SomaChannel  *ch  = &g_channels.channels[idx];
-    PlayerStatus  st  = player_status();
-
-    int      sw   = ap_get_screen_width();
-    int      sh   = ap_get_screen_height();
-    int      sb_h = ap_get_status_bar_height();
-    ap_theme *thm = ap_get_theme();
-
-    TTF_Font *flg  = ap_get_font(AP_FONT_LARGE);
-    TTF_Font *fsm  = ap_get_font(AP_FONT_SMALL);
-    TTF_Font *fxsm = ap_get_font(AP_FONT_TINY);
-
-    ap_draw_background();
-    ap_draw_status_bar(&g_status_bar);
-
-    /* Layout */
-    int pad      = AP_S(16);
-    int cont_top = sb_h + pad;
-    int cont_bot = sh - AP_S(44);
-    int cont_h   = cont_bot - cont_top;
-
-    /* Cover art – centered above text */
-    int cover_sz = 0;
-    int y        = cont_top;
-
-    if (g_cover_tex) {
-        cover_sz = AP_S(220);
-        if (cover_sz > cont_h / 2) cover_sz = cont_h / 2;
-        ap_draw_image(g_cover_tex, pad, y, cover_sz, cover_sz);
-        y += cover_sz + AP_S(12);
-    }
-
-    /* Status icon + title */
-    char title_buf[96];
-    const char *icon = (st == PLAYER_PLAYING) ? "\xe2\x97\x8f " :
-                       (st == PLAYER_ERROR)   ? "\xe2\x9c\x95 " :
-                                                "\xe2\x96\xa0 ";
-    snprintf(title_buf, sizeof(title_buf), "%s%s", icon, ch->title);
-
-    /* Genre · listeners */
-    char info_buf[128] = "";
-    if (ch->genre[0]) strncat(info_buf, ch->genre, 60);
-    if (ch->listeners > 0) {
-        char lbuf[24];
-        snprintf(lbuf, sizeof(lbuf), " \xc2\xb7 %d", ch->listeners);
-        strncat(info_buf, lbuf, sizeof(info_buf) - strlen(info_buf) - 1);
-    }
-
-    /* Read now-playing metadata (written by background thread) */
-    char np_title[SOMA_NP_LEN]  = "";
-    char np_artist[SOMA_NP_LEN] = "";
-    pthread_mutex_lock(&g_np_mutex);
-    memcpy(np_title,  g_np_title,  SOMA_NP_LEN);
-    memcpy(np_artist, g_np_artist, SOMA_NP_LEN);
-    pthread_mutex_unlock(&g_np_mutex);
-    int has_np = np_title[0] || np_artist[0];
-
-    int title_h = flg  ? TTF_FontHeight(flg)  : 0;
-    int info_h  = fsm  ? TTF_FontHeight(fsm)   : 0;
-    int desc_h  = fxsm && ch->description[0] ? TTF_FontHeight(fxsm) : 0;
-    int text_maxw = sw - 2 * pad;
-
-    /* When no cover: vertically center the text block */
-    if (!g_cover_tex) {
-        int total_h = title_h
-                    + (info_buf[0]        ? AP_S(6)  + info_h  : 0)
-                    + (ch->description[0] ? AP_S(10) + desc_h  : 0)
-                    + (has_np             ? AP_S(10) + info_h  : 0);
-        y = cont_top + (cont_h - total_h) / 2;
-        if (y < cont_top) y = cont_top;
-    }
-
-    if (flg) {
-        ap_color lightgray = {210, 210, 210, 255};
-        ap_draw_text_ellipsized(flg, title_buf, pad, y, lightgray, text_maxw);
-        y += title_h;
-    }
-    if (fsm && info_buf[0]) {
-        y += AP_S(6);
-        ap_draw_text_ellipsized(fsm, info_buf, pad, y, thm->hint, text_maxw);
-        y += info_h;
-    }
-    if (fxsm && ch->description[0]) {
-        y += AP_S(10);
-        ap_draw_text_ellipsized(fxsm, ch->description, pad, y, thm->text, text_maxw);
-        y += desc_h;
-    }
-    if (fsm && has_np) {
-        char np_buf[SOMA_NP_LEN * 2 + 8];
-        if (np_artist[0] && np_title[0])
-            snprintf(np_buf, sizeof(np_buf),
-                     "\xe2\x99\xaa %s \xe2\x80\x93 %s", np_artist, np_title);
-        else if (np_artist[0])
-            snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_artist);
-        else
-            snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_title);
-        y += AP_S(10);
-        ap_color np_gray = {210, 210, 210, 255};
-        ap_draw_text_ellipsized(fsm, np_buf, pad, y, np_gray, text_maxw);
-    }
-
-    ap_footer_item footer[] = {
-        { .button = AP_BTN_B,    .label = "Back"                       },
-        { .button = AP_BTN_MENU, .label = "Settings"                   },
-        { .button = AP_BTN_A,    .label = "Stop", .is_confirm = true   },
-    };
-    ap_draw_footer(footer, 3);
-
-    ap_present();
-}
-
-// ----------------------------------------------------------------
-// Now Playing screen – custom loop with screen timeout
-// ----------------------------------------------------------------
-static void screen_now_playing(int idx) {
-    int      scr         = SCREEN_ON;
-    uint32_t last_input  = SDL_GetTicks();
-    uint32_t hint_start  = 0;
-    int      select_held = 0;
-
-    while (1) {
-        /* ── Input ───────────────────────────────────────────── */
-        ap_input_event ev;
-        while (ap_poll_input(&ev)) {
-            if (ev.button == AP_BTN_SELECT)
-                select_held = ev.pressed;
-
-            if (!ev.pressed) continue;
-
-            if (scr != SCREEN_ON) {
-                /* Screen is off: SELECT+A wakes, anything else shows hint */
-                if (ev.button == AP_BTN_A && select_held) {
-                    scr       = SCREEN_ON;
-                    last_input = SDL_GetTicks();
-
-#ifdef PLATFORM_TG5040
-                    backlight_on();
-#endif
-                } else if (scr == SCREEN_OFF) {
-                    scr        = SCREEN_HINT;
-                    hint_start = SDL_GetTicks();
-#ifdef PLATFORM_TG5040
-                    backlight_on();
-#endif
-                }
-                continue;
-            }
-
-            last_input = SDL_GetTicks();
-
-            if (ev.button == AP_BTN_SELECT) {
-                scr = SCREEN_OFF;
-
-#ifdef PLATFORM_TG5040
-                backlight_off();
-#endif
-                continue;
-            }
-            if (ev.button == AP_BTN_B) return;
-            if (ev.button == AP_BTN_MENU) { screen_settings(); last_input = SDL_GetTicks(); continue; }
-            if (ev.button == AP_BTN_A) {
-                player_stop();
-                np_stop();
-                g_playing_idx = -1;
-                return;
-            }
-        }
-
-        /* ── Screen-timeout logic ────────────────────────────── */
-        uint32_t now    = SDL_GetTicks();
-        int      was_on = (scr == SCREEN_ON);
-
-        if (scr == SCREEN_ON && g_settings.screen_timeout > 0
-                && (now - last_input) >= (uint32_t)(g_settings.screen_timeout * 1000)) {
-            scr = SCREEN_OFF;
-        }
-        if (scr == SCREEN_HINT && (now - hint_start) >= 1000u) {
-            scr = SCREEN_OFF;
-#ifdef PLATFORM_TG5040
-            backlight_off();
-#endif
-        }
-
-        if (was_on && scr != SCREEN_ON) {
-#ifdef PLATFORM_TG5040
-            backlight_off();
-#endif
-        } else if (!was_on && scr == SCREEN_ON) {
-#ifdef PLATFORM_TG5040
-            backlight_on();
-#endif
-        }
-
-        /* ── Render ──────────────────────────────────────────── */
-        if (scr != SCREEN_ON) {
-            render_screen_off(scr == SCREEN_HINT);
-            SDL_Delay(50);
-        } else {
-            render_now_playing(idx);
-            SDL_Delay(33);   /* ~30 fps */
-        }
-    }
-}
-
-// ----------------------------------------------------------------
-// Stations screen  –  all channels, X = toggle favorite
-// Returns 0 to go back to main menu, 1 to loop within screen.
-// ----------------------------------------------------------------
-static int screen_stations(void) {
-    if (g_channels.count == 0) return 0;
-
-    static ap_list_item items[SOMA_MAX_CHANNELS];
-    static char         trailing[SOMA_MAX_CHANNELS][80];
-
-    for (int i = 0; i < g_channels.count; i++) {
-        SomaChannel *ch  = &g_channels.channels[i];
-        bool is_playing  = (i == g_playing_idx);
-        bool is_fav      = favorites_contains(&g_favorites, ch->id);
-
-        trailing[i][0] = '\0';
-        if (is_playing) strcat(trailing[i], MARK_PLAY);
-        if (is_fav)     strcat(trailing[i], MARK_STAR);
-        if (ch->genre[0]) strncat(trailing[i], ch->genre, 40);
-
-        items[i] = (ap_list_item){
-            .label        = ch->title,
-            .trailing_text = trailing[i][0] ? trailing[i] : NULL,
-        };
-    }
-
-    ap_footer_item footer_base[] = {
-        { .button = AP_BTN_B,    .label = "Back"                           },
-        { .button = AP_BTN_X,    .label = "\xe2\x98\x85"                  },
-        { .button = AP_BTN_A,    .label = "Play", .is_confirm = true       },
-    };
-    ap_footer_item footer_stop[] = {
-        { .button = AP_BTN_B,    .label = "Back"                           },
-        { .button = AP_BTN_X,    .label = "\xe2\x98\x85"                  },
-        { .button = AP_BTN_Y,    .label = "Stop"                           },
-        { .button = AP_BTN_A,    .label = "Play", .is_confirm = true       },
-    };
-
-    ap_list_opts opts = ap_list_default_opts("Stations", items, g_channels.count);
-    opts.status_bar    = &g_status_bar;
-    opts.action_button = AP_BTN_X;
-    opts.initial_index = (g_playing_idx >= 0) ? g_playing_idx : 0;
-
-    if (g_playing_idx >= 0) {
-        opts.footer                  = footer_stop;
-        opts.footer_count            = 4;
-        opts.secondary_action_button = AP_BTN_Y;
-    } else {
-        opts.footer       = footer_base;
-        opts.footer_count = 3;
-    }
-
-    ap_list_result result;
-    int rc = ap_list(&opts, &result);
-
-    if (rc == AP_CANCELLED) return 0;
-
-    if (result.action == AP_ACTION_TRIGGERED) {
-        favorites_toggle(&g_favorites, g_channels.channels[result.selected_index].id);
-        return 1;
-    }
-    if (result.action == AP_ACTION_SECONDARY_TRIGGERED) {
-        player_stop();
-        np_stop();
-        g_playing_idx = -1;
-        return 1;
-    }
-
-    int idx = result.selected_index;
-    if (idx == g_playing_idx) { screen_now_playing(idx); return 1; }
-    if (play_channel(idx)) { load_cover(idx); screen_now_playing(idx); }
-    return 1;
-}
-
-// ----------------------------------------------------------------
-// Favorites screen  –  saved favorites, X = remove
-// Returns 0 to go back to main menu, 1 to loop within screen.
-// ----------------------------------------------------------------
-static int screen_favorites(void) {
-    static ap_list_item fav_items[SOMA_MAX_CHANNELS];
-    static int          fav_chan[SOMA_MAX_CHANNELS];
-    static char         fav_trailing[SOMA_MAX_CHANNELS][64];
-    int fav_count = 0;
-
-    for (int i = 0; i < g_channels.count; i++) {
-        if (!favorites_contains(&g_favorites, g_channels.channels[i].id)) continue;
-        SomaChannel *ch = &g_channels.channels[i];
-        bool is_playing = (i == g_playing_idx);
-
-        fav_trailing[fav_count][0] = '\0';
-        if (is_playing) strcat(fav_trailing[fav_count], MARK_PLAY);
-        if (ch->genre[0]) strncat(fav_trailing[fav_count], ch->genre, 40);
-
-        fav_items[fav_count] = (ap_list_item){
-            .label        = ch->title,
-            .trailing_text = fav_trailing[fav_count][0] ? fav_trailing[fav_count] : NULL,
-        };
-        fav_chan[fav_count] = i;
-        fav_count++;
-    }
-
-    if (fav_count == 0) {
-        show_message("Favorites",
-            "No favorites saved yet.\nGo to Stations and press \xe2\x98\x85 to add one.");
-        return 0;
-    }
-
-    int initial = 0;
-    for (int j = 0; j < fav_count; j++)
-        if (fav_chan[j] == g_playing_idx) { initial = j; break; }
-
-    ap_footer_item footer_base[] = {
-        { .button = AP_BTN_B, .label = "Back"                              },
-        { .button = AP_BTN_X, .label = "Remove"                            },
-        { .button = AP_BTN_A, .label = "Play",   .is_confirm = true        },
-    };
-    ap_footer_item footer_stop[] = {
-        { .button = AP_BTN_B, .label = "Back"                              },
-        { .button = AP_BTN_X, .label = "Remove"                            },
-        { .button = AP_BTN_Y, .label = "Stop"                              },
-        { .button = AP_BTN_A, .label = "Play",   .is_confirm = true        },
-    };
-
-    ap_list_opts opts = ap_list_default_opts("Favorites", fav_items, fav_count);
-    opts.status_bar    = &g_status_bar;
-    opts.action_button = AP_BTN_X;
-    opts.initial_index = initial;
-
-    if (g_playing_idx >= 0) {
-        opts.footer                  = footer_stop;
-        opts.footer_count            = 4;
-        opts.secondary_action_button = AP_BTN_Y;
-    } else {
-        opts.footer       = footer_base;
-        opts.footer_count = 3;
-    }
-
-    ap_list_result result;
-    int rc = ap_list(&opts, &result);
-
-    if (rc == AP_CANCELLED) return 0;
-
-    if (result.action == AP_ACTION_TRIGGERED) {
-        favorites_toggle(&g_favorites, g_channels.channels[fav_chan[result.selected_index]].id);
-        return 1;
-    }
-    if (result.action == AP_ACTION_SECONDARY_TRIGGERED) {
-        player_stop();
-        np_stop();
-        g_playing_idx = -1;
-        return 1;
-    }
-
-    int ch_idx = fav_chan[result.selected_index];
-    if (ch_idx == g_playing_idx) { screen_now_playing(ch_idx); return 1; }
-    if (play_channel(ch_idx)) { load_cover(ch_idx); screen_now_playing(ch_idx); }
-    return 1;
-}
-
-// ----------------------------------------------------------------
-// Main menu  –  folder selector
-// Returns 0 to exit app, 1 to loop.
-// ----------------------------------------------------------------
-// Main menu – custom render loop so MENU can open Settings
-// ----------------------------------------------------------------
-static void render_main_menu(int cursor) {
-    int      sw   = ap_get_screen_width();
-    ap_theme *thm = ap_get_theme();
-    TTF_Font *fm  = ap_get_font(AP_FONT_LARGE);
+/* Full-screen overlay drawn on top of render_main() while MENU is held.
+   Shows key hints and the SomaFM support URL.
+   Does NOT call ap_present() – the caller handles that. */
+static void render_key_hint_overlay(void) {
+    int sw = ap_get_screen_width();
+    int sh = ap_get_screen_height();
+    TTF_Font *flg = ap_get_font(AP_FONT_LARGE);
     TTF_Font *fsm = ap_get_font(AP_FONT_SMALL);
 
-    /* Count favorites for display */
-    int fav_count = 0;
-    for (int i = 0; i < g_channels.count; i++)
-        if (favorites_contains(&g_favorites, g_channels.channels[i].id))
-            fav_count++;
+    /* Semi-transparent dark veil over the whole screen */
+    ap_color bg = {0, 0, 0, 210};
+    ap_draw_rect(0, 0, sw, sh, bg);
 
-    char stations_val[16], favs_val[16];
-    snprintf(stations_val, sizeof(stations_val), "%d", g_channels.count);
-    snprintf(favs_val,     sizeof(favs_val),     "%d", fav_count);
+    /* Key-hint lines */
+    const char *hints[] = {
+        "A / START   \xe2\x80\x94   Play / Stop",
+        "\xe2\x86\x91 / \xe2\x86\x93     \xe2\x80\x94   Station navigieren",
+        "X           \xe2\x80\x94   Favorit \xe2\x98\x85 umschalten",
+        "B           \xe2\x80\x94   Beenden",
+    };
+    int hint_count = 4;
 
-    const char *labels[2] = { "Stations",  "Favorites" };
-    const char *vals[2]   = { stations_val, favs_val   };
+    /* Measure the total block height so we can centre it vertically */
+    int title_h = flg ? TTF_FontHeight(flg) + AP_S(20) : AP_S(36);
+    int line_h  = fsm ? TTF_FontHeight(fsm) + AP_S(10) : AP_S(28);
+    int url_h   = fsm ? TTF_FontHeight(fsm) + AP_S(14) : AP_S(22);
+    int total_h = title_h + hint_count * line_h + url_h;
 
-    ap_draw_background();
-    ap_draw_status_bar(&g_status_bar);
-    ap_draw_screen_title("SomaFM Radio", &g_status_bar);
+    int y     = (sh - total_h) / 2;
+    int pad_x = AP_S(80);
 
-    if (!fm) { ap_present(); return; }
-
-    int fh     = TTF_FontHeight(fm);
-    int item_h = fh + AP_S(14);
-    int pad_x  = AP_S(30);
-    int start_y = ap_get_status_bar_height() + AP_S(48) + AP_S(12);
-
-    for (int i = 0; i < 2; i++) {
-        int  iy  = start_y + i * item_h;
-        bool sel = (i == cursor);
-        if (sel) ap_draw_rect(0, iy - AP_S(5), sw, item_h, thm->highlight);
-        ap_color tc = sel ? thm->highlighted_text : thm->text;
-        ap_draw_text(fm, labels[i], pad_x, iy, tc);
-        int vw = ap_measure_text(fm, vals[i]);
-        ap_draw_text(fm, vals[i], sw - pad_x - vw, iy, tc);
+    /* Heading: "Support SomaFM ♥" */
+    if (flg) {
+        ap_color yellow = {255, 220, 60, 255};
+        ap_draw_text(flg, "Support SomaFM \xe2\x99\xa5", pad_x, y, yellow);
+        y += title_h;
     }
 
-    /* Footer */
-    ap_footer_item footer_base[] = {
-        { .button = AP_BTN_B,    .label = "Exit"                        },
-        { .button = AP_BTN_MENU, .label = "Settings"                    },
-        { .button = AP_BTN_A,    .label = "Open", .is_confirm = true    },
-    };
-    ap_footer_item footer_stop[] = {
-        { .button = AP_BTN_B,    .label = "Exit"                        },
-        { .button = AP_BTN_MENU, .label = "Settings"                    },
-        { .button = AP_BTN_Y,    .label = "Stop"                        },
-        { .button = AP_BTN_A,    .label = "Open", .is_confirm = true    },
-    };
-    if (g_playing_idx >= 0)
-        ap_draw_footer(footer_stop, 4);
-    else
-        ap_draw_footer(footer_base, 3);
+    /* Key hints */
+    ap_color hint_col = {210, 210, 210, 255};
+    for (int i = 0; i < hint_count; i++) {
+        if (fsm) ap_draw_text(fsm, hints[i], pad_x, y, hint_col);
+        y += line_h;
+    }
 
+    /* Donation URL */
     if (fsm) {
-        const char *hint = "\xe2\x86\x91\xe2\x86\x93 Select   A: Open   B: Exit   MENU: Settings";
-        int hw = ap_measure_text(fsm, hint);
-        (void)hw; /* hint already in footer */
+        ap_color grey = {140, 140, 140, 255};
+        y += AP_S(4);
+        ap_draw_text(fsm, "somafm.com/support/", pad_x, y, grey);
     }
-
-    ap_present();
 }
 
-static void screen_main_menu(void) {
-    int cursor  = 0;
-    int scr_off = 0;
+/* Draw the single main screen:
+   – black background
+   – cover art right-aligned at full content height, fading to black on the left
+   – status bar (with now-playing pill centred inside it)
+   – scrollable station list on the left
+   – footer buttons
+   Does NOT call ap_present() so the caller can layer overlays on top. */
+static void render_main(void) {
+    int sw   = ap_get_screen_width();
+    int sh   = ap_get_screen_height();
+    int sb_h = ap_get_status_bar_height();
+    int ft_h = AP_S(44);                /* footer height */
+    int cont_top = sb_h;
+    int cont_bot = sh  - ft_h;
+    int cont_h   = cont_bot - cont_top;
+
+    ap_theme *thm  = ap_get_theme();
+    TTF_Font *fxsm = ap_get_font(AP_FONT_TINY);
+
+    /* ── Black background ──────────────────────────────────────── */
+    ap_color black = {0, 0, 0, 255};
+    ap_draw_rect(0, 0, sw, sh, black);
+
+    /* ── Cover art: right-aligned, square, fills content height ── */
+    /* SomaFM artwork is square.  We set the drawn size to cont_h × cont_h
+       so the image fills the full height of the content area. */
+    int cover_sz = cont_h;
+    int cover_x  = sw - cover_sz;   /* flush against the right edge */
+
+    if (g_cover_tex) {
+        ap_draw_image(g_cover_tex, cover_x, cont_top, cover_sz, cont_h);
+    }
+
+    /* ── Gradient: black on left, transparent on right ─────────── */
+    /* Draw 48 vertical strips over the cover area.  The leftmost strip is
+       fully opaque black; opacity decreases to 0 at the right edge.
+       This makes the cover bleed into the black background smoothly. */
+    {
+        int steps  = 48;
+        int grad_w = cover_sz;
+        for (int i = 0; i < steps; i++) {
+            int   x = cover_x + (grad_w * i       / steps);
+            int   w = cover_x + (grad_w * (i + 1) / steps) - x;
+            if (w < 1) w = 1;
+            Uint8 a = (Uint8)(255 - (255 * i / (steps - 1)));
+            ap_color c = {0, 0, 0, a};
+            ap_draw_rect(x, cont_top, w, cont_h, c);
+        }
+    }
+
+    /* ── Status bar (battery / clock / wifi) ───────────────────── */
+    ap_draw_status_bar(&g_status_bar);
+
+    /* ── Now-playing pill in the centre of the status bar ───────── */
+    /* Read metadata written by the background polling thread. */
+    {
+        char np_title[SOMA_NP_LEN]  = "";
+        char np_artist[SOMA_NP_LEN] = "";
+        pthread_mutex_lock(&g_np_mutex);
+        memcpy(np_title,  g_np_title,  SOMA_NP_LEN);
+        memcpy(np_artist, g_np_artist, SOMA_NP_LEN);
+        pthread_mutex_unlock(&g_np_mutex);
+
+        if (fxsm && (np_title[0] || np_artist[0])) {
+            /* Build "♪ Artist – Title" (or just one if only one exists) */
+            char np_buf[SOMA_NP_LEN * 2 + 8];
+            if (np_artist[0] && np_title[0])
+                snprintf(np_buf, sizeof(np_buf),
+                         "\xe2\x99\xaa %s \xe2\x80\x93 %s", np_artist, np_title);
+            else if (np_artist[0])
+                snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_artist);
+            else
+                snprintf(np_buf, sizeof(np_buf), "\xe2\x99\xaa %s", np_title);
+
+            int text_w = ap_measure_text(fxsm, np_buf);
+            int text_h = TTF_FontHeight(fxsm);
+
+            /* Centre the pill horizontally in the screen, vertically in the status bar */
+            int tx = (sw - text_w) / 2;
+            int ty = (sb_h - text_h) / 2;
+
+            int pad = AP_S(6);
+            ap_color np_bg = {40, 40, 40, 180};
+            ap_draw_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, text_h + pad, np_bg);
+
+            ap_color np_fg = {220, 220, 220, 255};
+            ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
+        }
+    }
+
+    /* ── Stations list (left column) ────────────────────────────── */
+    if (fxsm && g_channels.count > 0) {
+        int list_pad_x = AP_S(12);
+        /* Keep list text away from the cover; use the full left portion */
+        int list_maxw  = cover_x - AP_S(8);
+        int item_h     = TTF_FontHeight(fxsm) + AP_S(5);
+        int visible    = cont_h / item_h;   /* how many items fit on screen */
+
+        /* Scroll offset: keep g_cursor within the visible window */
+        int scroll = 0;
+        if (g_cursor >= visible) scroll = g_cursor - visible + 1;
+
+        for (int i = 0; i < visible; i++) {
+            int ch_i = scroll + i;
+            if (ch_i >= g_channels.count) break;
+
+            SomaChannel *ch      = &g_channels.channels[ch_i];
+            bool         sel     = (ch_i == g_cursor);
+            bool         playing = (ch_i == g_playing_idx);
+            bool         fav     = favorites_contains(&g_favorites, ch->id);
+
+            int iy = cont_top + i * item_h;
+
+            /* Highlight bar behind the selected item */
+            if (sel) {
+                ap_color hl = thm->highlight;
+                hl.a = 160;   /* semi-transparent so gradient shows through */
+                ap_draw_rect(0, iy, cover_x, item_h, hl);
+            }
+
+            /* "▶ ★ Station Name" */
+            char label[128] = "";
+            if (playing) strcat(label, MARK_PLAY);
+            if (fav)     strcat(label, MARK_STAR);
+            strncat(label, ch->title, sizeof(label) - strlen(label) - 1);
+
+            ap_color tc = sel ? thm->highlighted_text : thm->text;
+            ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
+        }
+    }
+
+    /* ── Footer ─────────────────────────────────────────────────── */
+    {
+        ap_footer_item footer_play[] = {
+            { .button = AP_BTN_B, .label = "Exit"                      },
+            { .button = AP_BTN_X, .label = "\xe2\x98\x85"              },
+            { .button = AP_BTN_A, .label = "Play", .is_confirm = true  },
+        };
+        ap_footer_item footer_stop[] = {
+            { .button = AP_BTN_B, .label = "Exit"                      },
+            { .button = AP_BTN_X, .label = "\xe2\x98\x85"              },
+            { .button = AP_BTN_A, .label = "Stop", .is_confirm = true  },
+        };
+        if (g_playing_idx >= 0)
+            ap_draw_footer(footer_stop, 3);
+        else
+            ap_draw_footer(footer_play, 3);
+    }
+}
+
+// ----------------------------------------------------------------
+// Main screen loop – the only screen in the app
+// ----------------------------------------------------------------
+static void screen_main(void) {
+    bool     show_hint  = false;
+    uint32_t last_ticks = SDL_GetTicks();
+
+    /* Pre-load the cover for the initial cursor position so something
+       is visible right away when the user opens the app. */
+    if (g_cursor >= 0 && g_cursor < g_channels.count)
+        load_cover(g_cursor);
 
     while (1) {
+        /* ── Screen timeout timer ────────────────────────────────── */
+        uint32_t now_ticks = SDL_GetTicks();
+        screen_update(now_ticks - last_ticks);
+        last_ticks = now_ticks;
+
+        /* ── Input ────────────────────────────────────────────────── */
         ap_input_event ev;
         while (ap_poll_input(&ev)) {
-            if (!ev.pressed) continue;
-
-            if (ev.button == AP_BTN_SELECT) {
-                scr_off = 1;
-
-#ifdef PLATFORM_TG5040
-                backlight_off();
-#endif
+            /* MENU: show overlay on press, hide on release.
+               Handle this regardless of screen-off state so the overlay
+               appears the moment the button is pressed. */
+            if (ev.button == AP_BTN_MENU) {
+                show_hint = ev.pressed;
                 continue;
             }
 
-            if (scr_off) {
-                scr_off = 0;
-#ifdef PLATFORM_TG5040
-                backlight_on();
-#endif
-                continue;
-            }
+            if (!ev.pressed) continue;   /* ignore button-up events for all others */
+
+            /* While the screen is off, swallow all input.
+               The power button is handled by its own thread in screen.c. */
+            if (screen_is_off()) continue;
+
+            screen_activity();   /* reset the idle timer */
 
             switch (ev.button) {
+
                 case AP_BTN_UP:
-                    cursor = cursor > 0 ? cursor - 1 : 1;
+                    if (g_cursor > 0) g_cursor--;
                     break;
+
                 case AP_BTN_DOWN:
-                    cursor = cursor < 1 ? cursor + 1 : 0;
+                    if (g_cursor < g_channels.count - 1) g_cursor++;
                     break;
+
                 case AP_BTN_A:
-                    if (cursor == 0) while (screen_stations()) ;
-                    else             while (screen_favorites()) ;
-                    break;
-                case AP_BTN_Y:
+                case AP_BTN_START:
                     if (g_playing_idx >= 0) {
+                        /* Stop the currently playing station */
                         player_stop();
                         np_stop();
                         g_playing_idx = -1;
+                    } else {
+                        /* Play the highlighted station */
+                        if (play_channel(g_cursor))
+                            load_cover(g_cursor);
                     }
                     break;
-                case AP_BTN_MENU:
-                    screen_settings();
+
+                case AP_BTN_X:
+                    /* Toggle favourite for the highlighted station */
+                    if (g_cursor >= 0 && g_cursor < g_channels.count)
+                        favorites_toggle(&g_favorites, g_channels.channels[g_cursor].id);
                     break;
-                case AP_BTN_B:
-                    return;
+
+                case AP_BTN_B: {
+                    /* Confirm before quitting */
+                    ap_footer_item footer[] = {
+                        { .button = AP_BTN_B, .label = "Cancel"                   },
+                        { .button = AP_BTN_A, .label = "Exit", .is_confirm = true },
+                    };
+                    ap_message_opts opts = {
+                        .message      = "Exit SomaFM Radio?",
+                        .footer       = footer,
+                        .footer_count = 2,
+                    };
+                    ap_confirm_result r;
+                    ap_confirmation(&opts, &r);
+                    if (r.confirmed) {
+                        player_stop();
+                        np_stop();
+                        return;   /* back to main() → cleanup */
+                    }
+                    break;
+                }
+
                 default: break;
             }
         }
 
-        if (scr_off) {
-            render_screen_off(0);
+        /* ── Render ────────────────────────────────────────────── */
+        if (screen_is_off()) {
+            render_screen_off();          /* solid black + ap_present */
             SDL_Delay(50);
         } else {
-            render_main_menu(cursor);
-            SDL_Delay(16);
+            render_main();                /* draws everything except overlay */
+            if (show_hint)
+                render_key_hint_overlay();/* layered on top when MENU is held */
+            ap_present();
+            SDL_Delay(16);                /* ~60 fps */
         }
     }
 }
@@ -897,13 +598,15 @@ int main(void) {
         .cpu_speed    = AP_CPU_SPEED_NORMAL,
     };
     if (ap_init(&cfg) != AP_OK) return 1;
-    ap_set_power_handler(false);
+    ap_set_power_handler(false);   /* we manage the power button ourselves in screen.c */
+    screen_init();
+    screen_init_power();
 
     soma_init();
     player_init();
     favorites_load(&g_favorites);
-    settings_load(&g_settings);
 
+    /* Enable WiFi if it isn't already active */
     if (!wifi_is_active()) {
         show_message("WiFi", "Enabling WiFi, please wait...");
         if (!wifi_enable()) {
@@ -913,17 +616,25 @@ int main(void) {
         }
     }
 
+    /* Fetch the full station list from the SomaFM API */
     if (!soma_fetch_channels(&g_channels) || g_channels.count == 0) {
         show_message("Network Error",
             "Could not load station list.\nCheck your internet connection.");
         goto cleanup;
     }
 
-    screen_main_menu();
+    /* Position the cursor at the last played station (or fall back to station 0) */
+    {
+        int last = load_last_station();
+        g_cursor = (last >= 0 && last < g_channels.count) ? last : 0;
+    }
+
+    screen_main();
 
 cleanup:
     player_cleanup();
     soma_cleanup();
+    screen_quit_power();
     ap_quit();
     return 0;
 }
