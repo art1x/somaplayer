@@ -542,8 +542,8 @@ static void render_main(void) {
     /* ── Stations list (left column) ────────────────────────────── */
     if (fxsm && g_channels.count > 0) {
         int list_pad_x = AP_S(12);
-        /* Keep list text away from the cover; use the full left portion */
-        int list_maxw  = cover_x - AP_S(8);
+        /* Text may overlap the cover – limit only at the right screen edge */
+        int list_maxw  = sw - list_pad_x - AP_S(8);
         int item_h     = TTF_FontHeight(fxsm) + AP_S(5);
         int visible    = cont_h / item_h;   /* how many items fit on screen */
 
