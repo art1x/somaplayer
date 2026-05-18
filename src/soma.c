@@ -112,7 +112,10 @@ int soma_fetch_channels(SomaChannelList *out) {
         cJSON *jgenre  = cJSON_GetObjectItem(ch, "genre");
         cJSON *jid     = cJSON_GetObjectItem(ch, "id");
         cJSON *jlist   = cJSON_GetObjectItem(ch, "listeners");
-        cJSON *jimg    = cJSON_GetObjectItem(ch, "image");
+        /* largeimage is ~640 px; fall back to image (~100 px) if absent */
+        cJSON *jimg    = cJSON_GetObjectItem(ch, "largeimage");
+        if (!jimg || !cJSON_IsString(jimg))
+            jimg = cJSON_GetObjectItem(ch, "image");
 
         if (!jtitle || !cJSON_IsString(jtitle)) continue;
 

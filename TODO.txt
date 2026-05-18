@@ -1,13 +1,20 @@
-- ich möchte es noch weiter vereinfachen, es gibt nur noch einen Screen
-  > Basierend auf den Player Screen
-- Cover in voller höhe am rechten Bildschirmrand ausgerichtet
-  > Verläuft nach links ins Schwarze
-- Stations Liste am linken Rand, kleinere Schrift
-- Info was gerade Spielt kommt in die Statusleiste mit Grau transparentem Hintergrund
-- Stationsname muss nicht mehr extra angezeigt werden
-- Overlay weiterhin auf menubutton (spenden hinweis)
-- A, Start > Play/Stop
-- beim beenden nachfragen
-- hoch runter navigiert Stationsliste
-- X > Fovoriten toggle
-- Wifi Screen, kein ok, automatisch aktivieren und wenn aktiviert ausblenden, wenn fehlgeschlagen, meldung 'connect to wifi'
+[x] ich möchte es noch weiter vereinfachen, es gibt nur noch einen Screen
+    > Basierend auf den Player Screen
+[x] Cover in voller höhe am rechten Bildschirmrand ausgerichtet
+    > Verläuft nach links ins Schwarze
+[x] Stations Liste am linken Rand, kleinere Schrift
+[x] Info was gerade Spielt kommt in die Statusleiste mit Grau transparentem Hintergrund
+[x] Stationsname muss nicht mehr extra angezeigt werden
+[x] Overlay weiterhin auf menubutton (spenden hinweis)
+[x] A, Start > Play/Stop
+[x] beim beenden nachfragen
+[x] hoch runter navigiert Stationsliste
+[x] X > Fovoriten toggle
+[ ] Wifi Screen, kein ok, automatisch aktivieren und wenn aktiviert ausblenden, wenn fehlgeschlagen, meldung 'connect to wifi'
+[ ] Hintergrund in voller höhe darstellen
+[ ] Playinfo links ausgerichtet
+[ ] links rechts button > nächste vorherige Station
+[ ] cursor bleibt immer in der Mitte stehen, endlosscrollen
+[ ] cover in besserer auflösung verfügbar?
+[ ] Start in Footer Mitte
+[ ] A Button nur zum auswählen/starten

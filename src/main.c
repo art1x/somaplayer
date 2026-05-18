@@ -242,6 +242,39 @@ static int load_last_station(void) {
 }
 
 // ----------------------------------------------------------------
+// WiFi – enable silently, auto-proceed on success
+// ----------------------------------------------------------------
+
+/* Shows a connecting screen (no user input), calls wifi_enable() synchronously.
+   Returns true if WiFi is up.  On failure shows a brief error and returns false. */
+static bool ensure_wifi(void) {
+    if (wifi_is_active()) return true;
+
+    /* Draw a minimal "connecting" screen – no OK button, auto-proceeds */
+    {
+        int      sw  = ap_get_screen_width();
+        int      sh  = ap_get_screen_height();
+        TTF_Font *fm = ap_get_font(AP_FONT_LARGE);
+        ap_color black = {0, 0, 0, 255};
+        ap_draw_rect(0, 0, sw, sh, black);
+        ap_draw_status_bar(&g_status_bar);
+        if (fm) {
+            const char *msg = "Verbinde mit WLAN \xe2\x80\xa6";
+            int w = ap_measure_text(fm, msg);
+            int h = TTF_FontHeight(fm);
+            ap_color c = {200, 200, 200, 255};
+            ap_draw_text(fm, msg, (sw - w) / 2, (sh - h) / 2, c);
+        }
+        ap_present();
+    }
+
+    if (wifi_enable()) return true;
+
+    show_message("", "Connect to WiFi");
+    return false;
+}
+
+// ----------------------------------------------------------------
 // Playback helper
 // ----------------------------------------------------------------
 
@@ -293,12 +326,14 @@ static void render_key_hint_overlay(void) {
 
     /* Key-hint lines */
     const char *hints[] = {
-        "A / START   \xe2\x80\x94   Play / Stop",
-        "\xe2\x86\x91 / \xe2\x86\x93     \xe2\x80\x94   Station navigieren",
+        "START       \xe2\x80\x94   Play / Stop",
+        "A           \xe2\x80\x94   Station direkt wechseln",
+        "\xe2\x86\x91 / \xe2\x86\x93     \xe2\x80\x94   Navigieren",
+        "\xe2\x86\x90 / \xe2\x86\x92     \xe2\x80\x94   Vorherige / N\xc3\xa4" "chste",
         "X           \xe2\x80\x94   Favorit \xe2\x98\x85 umschalten",
         "B           \xe2\x80\x94   Beenden",
     };
-    int hint_count = 4;
+    int hint_count = 6;
 
     /* Measure the total block height so we can centre it vertically */
     int title_h = flg ? TTF_FontHeight(flg) + AP_S(20) : AP_S(36);
@@ -354,20 +389,19 @@ static void render_main(void) {
     ap_color black = {0, 0, 0, 255};
     ap_draw_rect(0, 0, sw, sh, black);
 
-    /* ── Cover art: right-aligned, square, fills content height ── */
-    /* SomaFM artwork is square.  We set the drawn size to cont_h × cont_h
-       so the image fills the full height of the content area. */
-    int cover_sz = cont_h;
+    /* ── Cover art: right-aligned, full screen height ────────────
+       Using sh (not cont_h) so the image extends behind the status bar
+       and footer, giving a full-bleed cinematic background. */
+    int cover_sz = sh;
     int cover_x  = sw - cover_sz;   /* flush against the right edge */
 
     if (g_cover_tex) {
-        ap_draw_image(g_cover_tex, cover_x, cont_top, cover_sz, cont_h);
+        ap_draw_image(g_cover_tex, cover_x, 0, cover_sz, sh);
     }
 
     /* ── Gradient: black on left, transparent on right ─────────── */
-    /* Draw 48 vertical strips over the cover area.  The leftmost strip is
-       fully opaque black; opacity decreases to 0 at the right edge.
-       This makes the cover bleed into the black background smoothly. */
+    /* Full screen height so the gradient also covers the status bar
+       and footer areas, keeping text readable everywhere. */
     {
         int steps  = 48;
         int grad_w = cover_sz;
@@ -377,7 +411,7 @@ static void render_main(void) {
             if (w < 1) w = 1;
             Uint8 a = (Uint8)(255 - (255 * i / (steps - 1)));
             ap_color c = {0, 0, 0, a};
-            ap_draw_rect(x, cont_top, w, cont_h, c);
+            ap_draw_rect(x, 0, w, sh, c);
         }
     }
 
@@ -408,8 +442,8 @@ static void render_main(void) {
             int text_w = ap_measure_text(fxsm, np_buf);
             int text_h = TTF_FontHeight(fxsm);
 
-            /* Centre the pill horizontally in the screen, vertically in the status bar */
-            int tx = (sw - text_w) / 2;
+            /* Left-align the pill, vertically centred in the status bar */
+            int tx = AP_S(12);
             int ty = (sb_h - text_h) / 2;
 
             int pad = AP_S(6);
@@ -429,9 +463,15 @@ static void render_main(void) {
         int item_h     = TTF_FontHeight(fxsm) + AP_S(5);
         int visible    = cont_h / item_h;   /* how many items fit on screen */
 
-        /* Scroll offset: keep g_cursor within the visible window */
-        int scroll = 0;
-        if (g_cursor >= visible) scroll = g_cursor - visible + 1;
+        /* Cursor stays near the centre of the visible window (Mitte-Scroll).
+           The list scrolls behind the cursor rather than the cursor moving
+           to the top or bottom of the screen. */
+        int half   = visible / 2;
+        int scroll = g_cursor - half;
+        if (scroll < 0) scroll = 0;
+        if (g_channels.count > visible && scroll > g_channels.count - visible)
+            scroll = g_channels.count - visible;
+        if (scroll < 0) scroll = 0;
 
         for (int i = 0; i < visible; i++) {
             int ch_i = scroll + i;
@@ -463,16 +503,17 @@ static void render_main(void) {
     }
 
     /* ── Footer ─────────────────────────────────────────────────── */
+    /* START is the central Play/Stop action; A selects/switches station. */
     {
         ap_footer_item footer_play[] = {
-            { .button = AP_BTN_B, .label = "Exit"                      },
-            { .button = AP_BTN_X, .label = "\xe2\x98\x85"              },
-            { .button = AP_BTN_A, .label = "Play", .is_confirm = true  },
+            { .button = AP_BTN_B,     .label = "Exit"                        },
+            { .button = AP_BTN_X,     .label = "\xe2\x98\x85"                },
+            { .button = AP_BTN_START, .label = "Play", .is_confirm = true    },
         };
         ap_footer_item footer_stop[] = {
-            { .button = AP_BTN_B, .label = "Exit"                      },
-            { .button = AP_BTN_X, .label = "\xe2\x98\x85"              },
-            { .button = AP_BTN_A, .label = "Stop", .is_confirm = true  },
+            { .button = AP_BTN_B,     .label = "Exit"                        },
+            { .button = AP_BTN_X,     .label = "\xe2\x98\x85"                },
+            { .button = AP_BTN_START, .label = "Stop", .is_confirm = true    },
         };
         if (g_playing_idx >= 0)
             ap_draw_footer(footer_stop, 3);
@@ -521,22 +562,40 @@ static void screen_main(void) {
             switch (ev.button) {
 
                 case AP_BTN_UP:
-                    if (g_cursor > 0) g_cursor--;
+                    /* Wrap from first item to last (Endlosscrollen) */
+                    g_cursor = (g_cursor > 0) ? g_cursor - 1 : g_channels.count - 1;
                     break;
 
                 case AP_BTN_DOWN:
-                    if (g_cursor < g_channels.count - 1) g_cursor++;
+                    /* Wrap from last item to first (Endlosscrollen) */
+                    g_cursor = (g_cursor < g_channels.count - 1) ? g_cursor + 1 : 0;
+                    break;
+
+                case AP_BTN_LEFT:
+                    /* Previous station with wrap, and play it immediately */
+                    g_cursor = (g_cursor > 0) ? g_cursor - 1 : g_channels.count - 1;
+                    if (play_channel(g_cursor)) load_cover(g_cursor);
+                    break;
+
+                case AP_BTN_RIGHT:
+                    /* Next station with wrap, and play it immediately */
+                    g_cursor = (g_cursor < g_channels.count - 1) ? g_cursor + 1 : 0;
+                    if (play_channel(g_cursor)) load_cover(g_cursor);
                     break;
 
                 case AP_BTN_A:
+                    /* A always plays / switches to the highlighted station */
+                    if (play_channel(g_cursor))
+                        load_cover(g_cursor);
+                    break;
+
                 case AP_BTN_START:
+                    /* START toggles play/stop */
                     if (g_playing_idx >= 0) {
-                        /* Stop the currently playing station */
                         player_stop();
                         np_stop();
                         g_playing_idx = -1;
                     } else {
-                        /* Play the highlighted station */
                         if (play_channel(g_cursor))
                             load_cover(g_cursor);
                     }
@@ -606,15 +665,8 @@ int main(void) {
     player_init();
     favorites_load(&g_favorites);
 
-    /* Enable WiFi if it isn't already active */
-    if (!wifi_is_active()) {
-        show_message("WiFi", "Enabling WiFi, please wait...");
-        if (!wifi_enable()) {
-            show_message("WiFi Error",
-                "Could not connect to WiFi.\nCheck your WiFi settings.");
-            goto cleanup;
-        }
-    }
+    /* Enable WiFi silently (auto-proceeds on success, error on failure) */
+    if (!ensure_wifi()) goto cleanup;
 
     /* Fetch the full station list from the SomaFM API */
     if (!soma_fetch_channels(&g_channels) || g_channels.count == 0) {
