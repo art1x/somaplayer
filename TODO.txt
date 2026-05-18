@@ -10,11 +10,16 @@
 [x] beim beenden nachfragen
 [x] hoch runter navigiert Stationsliste
 [x] X > Fovoriten toggle
-[ ] Wifi Screen, kein ok, automatisch aktivieren und wenn aktiviert ausblenden, wenn fehlgeschlagen, meldung 'connect to wifi'
-[ ] Hintergrund in voller höhe darstellen
-[ ] Playinfo links ausgerichtet
-[ ] links rechts button > nächste vorherige Station
-[ ] cursor bleibt immer in der Mitte stehen, endlosscrollen
-[ ] cover in besserer auflösung verfügbar?
-[ ] Start in Footer Mitte
-[ ] A Button nur zum auswählen/starten
+[x] Wifi Screen, kein ok, automatisch aktivieren und wenn aktiviert ausblenden, wenn fehlgeschlagen, meldung 'connect to wifi'
+[x] Hintergrund in voller höhe darstellen
+[x] Playinfo links ausgerichtet
+[x] links rechts button > nächste vorherige Station
+[x] cursor bleibt immer in der Mitte stehen, endlosscrollen
+[x] cover in besserer auflösung verfügbar?
+[x] Start in Footer Mitte
+[x] A Button nur zum auswählen/starten
+[ ] Start button > nur play/stop für aktuellen song nicht neue auswahl abspielen
+[ ] Liste soll nicht bis in den Footer hineinragen
+[ ] würde es gehen das der Cursor immer in der Mitte stehen bleibt, die Liste scrollt quasie?
+[ ] 
+

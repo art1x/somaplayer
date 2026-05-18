@@ -463,19 +463,15 @@ static void render_main(void) {
         int item_h     = TTF_FontHeight(fxsm) + AP_S(5);
         int visible    = cont_h / item_h;   /* how many items fit on screen */
 
-        /* Cursor stays near the centre of the visible window (Mitte-Scroll).
-           The list scrolls behind the cursor rather than the cursor moving
-           to the top or bottom of the screen. */
-        int half   = visible / 2;
-        int scroll = g_cursor - half;
-        if (scroll < 0) scroll = 0;
-        if (g_channels.count > visible && scroll > g_channels.count - visible)
-            scroll = g_channels.count - visible;
-        if (scroll < 0) scroll = 0;
+        /* True centred-cursor scroll: cursor is always at position `half`.
+           Items above and below wrap around the full channel list so the
+           cursor never drifts from the centre of the screen. */
+        int half = visible / 2;
 
         for (int i = 0; i < visible; i++) {
-            int ch_i = scroll + i;
-            if (ch_i >= g_channels.count) break;
+            /* Map screen row i to a channel index with full wrap-around */
+            int ch_i = ((g_cursor - half + i) % g_channels.count
+                        + g_channels.count) % g_channels.count;
 
             SomaChannel *ch      = &g_channels.channels[ch_i];
             bool         sel     = (ch_i == g_cursor);
@@ -483,6 +479,9 @@ static void render_main(void) {
             bool         fav     = favorites_contains(&g_favorites, ch->id);
 
             int iy = cont_top + i * item_h;
+
+            /* Don't render items that would overlap the footer */
+            if (iy + item_h > cont_bot) break;
 
             /* Highlight bar behind the selected item */
             if (sel) {
@@ -590,14 +589,11 @@ static void screen_main(void) {
                     break;
 
                 case AP_BTN_START:
-                    /* START toggles play/stop */
+                    /* START only stops; use A to start a new station */
                     if (g_playing_idx >= 0) {
                         player_stop();
                         np_stop();
                         g_playing_idx = -1;
-                    } else {
-                        if (play_channel(g_cursor))
-                            load_cover(g_cursor);
                     }
                     break;
 
