@@ -611,13 +611,13 @@ static void render_main(void) {
                 ap_color white = {255, 255, 255, 230};
                 ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, white);
             } else if (playing) {
-                ap_color play_bg = {230, 195, 20, 170};
+                ap_color play_bg = {180, 180, 180, 160};
                 ap_draw_rounded_rect(pill_x, iy, pill_w, item_h, pill_r, play_bg);
             }
 
-            /* Cursor → black on white, playing → dark on yellow, otherwise → text */
-            ap_color tc = sel     ? (ap_color){0,   0,   0,   255} :
-                          playing ? (ap_color){30,  20,  0,   255} :
+            /* Cursor → black on white, playing → black on grey, otherwise → text */
+            ap_color tc = sel     ? (ap_color){0,  0,  0, 255} :
+                          playing ? (ap_color){20, 20, 20, 255} :
                                     thm->text;
             ap_draw_text_ellipsized(fxsm, label, list_pad_x, iy, tc, list_maxw);
 
@@ -645,12 +645,12 @@ static void render_main(void) {
             for (int i = 0; i < steps; i++) {
                 Uint8 a = (Uint8)(200 - (200 * i / (steps - 1)));
                 ap_color c = {0, 0, 0, a};
-                /* Top */
+                /* Top — list area only, don't touch the cover */
                 ap_draw_rect(0, cont_top + vign_h * i / steps,
-                             sw, vign_h / steps + 1, c);
+                             cover_x, vign_h / steps + 1, c);
                 /* Bottom */
                 ap_draw_rect(0, cont_bot - vign_h + vign_h * i / steps,
-                             sw, vign_h / steps + 1,
+                             cover_x, vign_h / steps + 1,
                              (ap_color){0, 0, 0, 200 - (Uint8)a});
             }
         }
