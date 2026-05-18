@@ -21,6 +21,16 @@
 [x] Start button > nur play/stop für aktuellen song nicht neue auswahl abspielen
 [x] Liste soll nicht bis in den Footer hineinragen
 [x] würde es gehen das der Cursor immer in der Mitte stehen bleibt, die Liste scrollt quasie?
-[ ] Screen Timeout wird noch nicht der Wert von NExt UI genommen
-[ ] Liste wird immernoch von Footer überlappt
-[ ] key hint overlay > die beiden Soma Texte untereinander
+[x] Screen Timeout wird noch nicht der Wert von NExt UI genommen
+[x] Liste wird immernoch von Footer überlappt
+[x] key hint overlay > die beiden Soma Texte untereinander
+[ ] now playing wird jetzt hervorgehoben, aber der Kontrast ist ziemlich schlecht zu erkennen
+[ ] Start button hält stream an spielt ihn aber nicht weiter bei 2. auslöser
+[ ] bitte alle UI elemente auf english (key hint overlay)
+[ ] info in Statusbar kann 2/3 vom Bildschirm breit sein
+[ ] Info in Statusbar endlosscrollen ende/Anfang deutlich kennzeichen ***
+[ ] Screen ging nach 1 min aus obwohl ich in NextUI 2min eingestellt habe
+
+
+
+

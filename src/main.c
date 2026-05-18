@@ -39,10 +39,11 @@
 // ----------------------------------------------------------------
 // Global state
 // ----------------------------------------------------------------
-static SomaChannelList g_channels    = {0};
-static int             g_playing_idx = -1;   /* index of playing channel, -1 = stopped */
-static int             g_cursor      = 0;    /* highlighted station in the list */
-static FavoriteList    g_favorites   = {0};
+static SomaChannelList g_channels         = {0};
+static int             g_playing_idx      = -1;   /* index of playing channel, -1 = stopped */
+static int             g_last_played_idx  = -1;   /* last station that was playing, for START resume */
+static int             g_cursor           = 0;    /* highlighted station in the list */
+static FavoriteList    g_favorites        = {0};
 
 static ap_status_bar_opts g_status_bar = {
     .show_clock   = AP_CLOCK_AUTO,
@@ -297,7 +298,7 @@ static bool ensure_wifi(void) {
         ap_draw_rect(0, 0, sw, sh, black);
         ap_draw_status_bar(&g_status_bar);
         if (fm) {
-            const char *msg = "Verbinde mit WLAN \xe2\x80\xa6";
+            const char *msg = "Connecting to WiFi \xe2\x80\xa6";
             int w = ap_measure_text(fm, msg);
             int h = TTF_FontHeight(fm);
             ap_color c = {200, 200, 200, 255};
@@ -364,12 +365,12 @@ static void render_key_hint_overlay(void) {
 
     /* Key-hint lines */
     const char *hints[] = {
-        "START       \xe2\x80\x94   Play / Stop",
-        "A           \xe2\x80\x94   Station direkt wechseln",
-        "\xe2\x86\x91 / \xe2\x86\x93     \xe2\x80\x94   Navigieren",
-        "\xe2\x86\x90 / \xe2\x86\x92     \xe2\x80\x94   Vorherige / N\xc3\xa4" "chste",
-        "X           \xe2\x80\x94   Favorit \xe2\x98\x85 umschalten",
-        "B           \xe2\x80\x94   Beenden",
+        "START       \xe2\x80\x94   Play / Stop (resume last)",
+        "A           \xe2\x80\x94   Play selected station",
+        "\xe2\x86\x91 / \xe2\x86\x93     \xe2\x80\x94   Navigate list",
+        "\xe2\x86\x90 / \xe2\x86\x92     \xe2\x80\x94   Previous / Next station",
+        "X           \xe2\x80\x94   Toggle favourite \xe2\x98\x85",
+        "B           \xe2\x80\x94   Quit",
     };
     int hint_count = 6;
 
@@ -485,8 +486,8 @@ static void render_main(void) {
             int ty  = (sb_h - text_h) / 2;
             int pad = AP_S(6);
 
-            /* Limit pill width to half the screen so battery/clock stay visible */
-            int pill_maxw = sw / 2 - AP_S(8);
+            /* Limit pill width to 2/3 of screen so battery/clock stay visible */
+            int pill_maxw = sw * 2 / 3;
 
             ap_color np_bg = {40, 40, 40, 180};
             ap_color np_fg = {220, 220, 220, 255};
@@ -506,19 +507,33 @@ static void render_main(void) {
                 /* 2 s pause at start, then scroll at 60 px/s */
                 if (g_ticker_ms > 2000)
                     g_ticker_px = (int)((g_ticker_ms - 2000) * 60 / 1000);
-                /* Loop back after full scroll */
-                if (g_ticker_px > text_w + AP_S(20)) {
+
+                ap_draw_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, text_h + pad, np_bg);
+
+                /* Draw text + "   ***   " separator + text again for seamless loop.
+                   The clip rect hides anything outside the pill area. */
+                const char *sep    = "   ***   ";
+                int          sep_w = ap_measure_text(fxsm, sep);
+                int          full_w = text_w + sep_w;   /* one full scroll cycle */
+
+                /* Loop back after one full cycle */
+                if (g_ticker_px > full_w) {
                     g_ticker_ms = 0;
                     g_ticker_px = 0;
                 }
 
-                ap_draw_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, text_h + pad, np_bg);
-
-                /* Clip to the pill area before drawing the scrolled text */
                 SDL_Renderer *rend = ap_get_renderer();
                 SDL_Rect clip = { tx - pad, 0, pill_maxw + 2 * pad, sb_h };
                 SDL_RenderSetClipRect(rend, &clip);
-                ap_draw_text(fxsm, np_buf, tx - g_ticker_px, ty, np_fg);
+
+                ap_color sep_col = {120, 120, 120, 255};
+                /* First copy of text */
+                ap_draw_text(fxsm, np_buf, tx - g_ticker_px,            ty, np_fg);
+                /* Separator */
+                ap_draw_text(fxsm, sep,    tx - g_ticker_px + text_w,   ty, sep_col);
+                /* Second copy (visible during wrap) */
+                ap_draw_text(fxsm, np_buf, tx - g_ticker_px + full_w,   ty, np_fg);
+
                 SDL_RenderSetClipRect(rend, NULL);
             }
         }
@@ -558,7 +573,7 @@ static void render_main(void) {
                 hl.a = 160;
                 ap_draw_rect(0, iy, cover_x, item_h, hl);
             } else if (playing) {
-                ap_color play_bg = {20, 60, 120, 100};
+                ap_color play_bg = {30, 90, 200, 160};
                 ap_draw_rect(0, iy, cover_x, item_h, play_bg);
             }
 
@@ -679,11 +694,17 @@ static void screen_main(void) {
                     break;
 
                 case AP_BTN_START:
-                    /* START only stops; use A to start a new station */
+                    /* START toggles the last-played station (stop ↔ resume).
+                       Does not switch to a different station — use A for that. */
                     if (g_playing_idx >= 0) {
+                        g_last_played_idx = g_playing_idx;
                         player_stop();
                         np_stop();
                         g_playing_idx = -1;
+                    } else {
+                        /* Resume last played station, or fall back to cursor */
+                        int resume = (g_last_played_idx >= 0) ? g_last_played_idx : g_cursor;
+                        if (play_channel(resume)) load_cover(resume);
                     }
                     break;
 
@@ -739,9 +760,12 @@ static void screen_main(void) {
 /* Try to read the screen timeout from known NextUI settings locations.
    Returns the timeout in milliseconds, or 60 000 (60 s) as fallback. */
 static uint32_t load_nextui_timeout(void) {
+    /* Try common NextUI settings file locations (key=value format, seconds) */
     const char *paths[] = {
         "/mnt/SDCARD/.userdata/shared/settings.txt",
+        "/mnt/SDCARD/.userdata/shared/minui.txt",
         "/mnt/SDCARD/.userdata/tg5040/settings.txt",
+        "/mnt/SDCARD/.userdata/tg5040/minui.txt",
         NULL
     };
     for (int i = 0; paths[i]; i++) {
@@ -755,7 +779,7 @@ static uint32_t load_nextui_timeout(void) {
             }
         fclose(f);
     }
-    return 60000;   /* 60 s fallback */
+    return 300000;   /* 5 min fallback — better than accidentally being shorter than NextUI */
 }
 
 // ----------------------------------------------------------------
