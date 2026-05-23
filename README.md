@@ -6,10 +6,7 @@ Browse and play SomaFM internet radio stations directly on your handheld.
 
 ## Features
 
-- **Single-screen UI** — scrollable station list with full-bleed cover art background
-- **Now Playing** — artist and track metadata in the status bar, updated every 30 s
 - **Favorites** — star any station with X; favorites shown inline in the list
-- **Infinite scroll** — cursor stays centred, list wraps around
 - **Left / Right** — switch to the previous or next station and play immediately
 - **Sleep timer** — auto-stop playback after 15 / 30 / 60 / 90 minutes
 - **Screen timeout** — backlight off after inactivity; reads timeout from NextUI settings
