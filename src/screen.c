@@ -29,6 +29,7 @@
 
 #define DISP_LCD_SET_BRIGHTNESS  0x102
 #define HINT_MS                  2000   /* how long hint backlight stays on */
+#define DIM_DURATION_MS          2000   /* gradual dim before full blank */
 
 static uint32_t s_timeout_ms = 30000;   /* configurable via screen_set_timeout() */
 static bool     s_off       = false;
@@ -144,6 +145,15 @@ void screen_on(void) {
 
 bool screen_is_off(void) {
     return s_off;
+}
+
+uint8_t screen_dim_alpha(void) {
+    if (s_off || s_timeout_ms == 0 || s_timeout_ms <= DIM_DURATION_MS) return 0;
+    uint32_t dim_start = s_timeout_ms - DIM_DURATION_MS;
+    if (s_idle_ms < dim_start) return 0;
+    uint32_t elapsed = s_idle_ms - dim_start;
+    if (elapsed >= DIM_DURATION_MS) return 255;
+    return (uint8_t)(255 * elapsed / DIM_DURATION_MS);
 }
 
 /* ── Power-button thread ──────────────────────────────────────────────────

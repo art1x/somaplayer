@@ -45,6 +45,11 @@ void screen_on(void);
 /* Returns true if the screen is currently off. */
 bool screen_is_off(void);
 
+/* Returns 0–255: how much to dim the rendered frame before the screen goes off.
+   0 = normal brightness, 255 = fully dimmed (screen about to blank).
+   The caller draws a black overlay with this alpha to simulate gradual dimming. */
+uint8_t screen_dim_alpha(void);
+
 /* Start power-button thread: short press → screen_off(), audio continues.
  * Call after screen_init().  Disable Apostrophe's handler first with
  * ap_set_power_handler(false) so it doesn't race and trigger suspend. */

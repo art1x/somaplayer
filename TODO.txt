@@ -32,6 +32,15 @@
 [x] Screen ging nach 1 min aus obwohl ich in NextUI 2min eingestellt habe
     > Fallback auf 5 min erhöht; liest NextUI settings.txt wenn vorhanden
 
-[ ] Stationsliste nicht abschneiden - genre anzeigen
-[ ] A button in Footer, ganz rechts
-[ ] now playing highlight nicht blau, helles gelb
+[x] Stationsliste nicht abschneiden - genre anzeigen
+[x] A button in Footer, ganz rechts
+[x] now playing highlight nicht blau, helles gelb
+
+[x] Screen timeout: read screentimeout= from $SHARED_USERDATA_PATH/minuisettings.txt (same as Takt)
+    > currently reads own settings.txt — should use NextUI's value directly
+[x] Auto-suspend: read suspendTimeout= from minuisettings.txt; suspend when screen off + stream stopped
+    > suspend path = $SDCARD_PATH/.system/$PLATFORM/bin/suspend (NOT /bin/suspend)
+    > stop mpg123 before suspending (releases ALSA); restart stream after wakeup
+    > reset last_ticks after system(suspend) returns to avoid immediate re-trigger
+[x] Screen off + suspend: move system(suspend) call out of screen module into main loop
+    > allows caller to stop audio and reset SDL timer before/after suspend

@@ -68,6 +68,10 @@ static          char g_cover_dl_path[320] = ""; /* path of the ready-to-load fil
 /* Sleep timer: milliseconds remaining; 0 = off */
 static uint32_t g_sleep_timer_ms = 0;
 
+/* Auto-suspend timeout: milliseconds of screen-off + no playback before
+   calling the system suspend script.  0 = disabled. */
+static uint32_t g_suspend_timeout_ms = 0;
+
 /* Description pill: hide after 10 s of no navigation; reset on every cursor move */
 static uint32_t g_desc_hide_at = 0;
 
@@ -605,19 +609,6 @@ static void render_main(void) {
                     ap_color live_fg = {255, 255, 255, 255};
                     ap_draw_rounded_rect(lx, ly - lp / 2, lw + 2 * lp, lh + lp, lh / 2, live_bg);
                     ap_draw_text(fxsm, "LIVE", lx + lp, ly, live_fg);
-
-                    /* Listener count in grey, no background, right after the LIVE pill */
-                    int lc = g_channels.channels[ch_i].listeners;
-                    if (lc > 0) {
-                        char lbuf[24];
-                        if (lc >= 1000)
-                            snprintf(lbuf, sizeof(lbuf), "%.1fk", lc / 1000.0);
-                        else
-                            snprintf(lbuf, sizeof(lbuf), "%d", lc);
-                        int cx = lx + lw + 2 * lp + AP_S(6);
-                        ap_color grey = {200, 200, 200, 255};
-                        ap_draw_text(fxsm, lbuf, cx, ly, grey);
-                    }
                 }
             }
         }
@@ -756,8 +747,9 @@ static void show_sleep_timer(void);   /* defined below */
 // Main screen loop – the only screen in the app
 // ----------------------------------------------------------------
 static void screen_main(void) {
-    bool     show_hint  = false;
-    uint32_t last_ticks = SDL_GetTicks();
+    bool     show_hint       = false;
+    uint32_t last_ticks      = SDL_GetTicks();
+    uint32_t suspend_idle_ms = 0;   /* how long screen has been off with no stream */
 
     /* Show description pill immediately on launch for 10 s */
     g_desc_hide_at = SDL_GetTicks() + 10000;
@@ -784,6 +776,48 @@ static void screen_main(void) {
                 player_stop(); np_stop(); g_playing_idx = -1;
             } else {
                 g_sleep_timer_ms -= elapsed;
+            }
+        }
+
+        /* ── Auto-suspend (screen off + no stream) ───────────────── */
+        /* Count how long both conditions are true simultaneously.
+           As soon as either changes (screen on, or stream starts), reset. */
+        if (screen_is_off() && g_playing_idx < 0)
+            suspend_idle_ms += elapsed;
+        else
+            suspend_idle_ms = 0;
+
+        if (g_suspend_timeout_ms > 0 && suspend_idle_ms >= g_suspend_timeout_ms) {
+            /* Conditions met — build the suspend path from env vars so it
+               works regardless of where NextUI is installed. */
+            const char *sdcard   = getenv("SDCARD_PATH");
+            const char *platform = getenv("PLATFORM");
+            if (!sdcard   || !sdcard[0])   sdcard   = "/mnt/SDCARD";
+            if (!platform || !platform[0]) platform = "tg5040";
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd), "%s/.system/%s/bin/suspend", sdcard, platform);
+
+            /* Stop audio first so ALSA is released before the kernel suspends.
+               Without this the kernel may retry S2RAM up to 5× with 3 s gaps. */
+            if (g_playing_idx >= 0) {
+                player_stop(); np_stop(); g_playing_idx = -1;
+            }
+
+            system(cmd);   /* blocks until device wakes up */
+
+            /* SDL_GetTicks() may reflect wall time after wakeup; reset the
+               frame-delta base so the first post-wakeup frame doesn't see
+               a huge elapsed value that would immediately re-trigger suspend. */
+            last_ticks      = SDL_GetTicks();
+            suspend_idle_ms = 0;
+
+            /* Bring the screen back on after wakeup. */
+            screen_on();
+
+            /* Restart the last stream so playback resumes automatically. */
+            if (g_last_played_idx >= 0) {
+                if (play_channel(g_last_played_idx))
+                    load_cover(g_last_played_idx);
             }
         }
 
@@ -950,28 +984,33 @@ static void show_sleep_timer(void) {
 }
 
 // ----------------------------------------------------------------
-// NextUI screen-timeout integration
+// NextUI settings integration (minuisettings.txt)
 // ----------------------------------------------------------------
 
-/* Try to read the screen timeout from known NextUI settings locations.
-   Returns the timeout in milliseconds, or 60 000 (60 s) as fallback. */
-static uint32_t load_nextui_timeout(void) {
-    /* Try common NextUI settings file locations (key=value format, seconds) */
-    /* NextUI stores settings in minuisettings.txt, key=value format.
-       screentimeout is in MINUTES (0 = never). */
-    FILE *f = fopen("/mnt/SDCARD/.userdata/shared/minuisettings.txt", "r");
-    if (f) {
-        char key[64]; int val;
-        while (fscanf(f, " %63[^=]=%d", key, &val) == 2) {
-            if (strcmp(key, "screentimeout") == 0) {
-                fclose(f);
-                if (val == 0) return 0;              /* 0 = never */
-                return (uint32_t)val * 1000;   /* seconds → milliseconds */
-            }
-        }
-        fclose(f);
+/* Read screentimeout and suspendTimeout from
+   $SHARED_USERDATA_PATH/minuisettings.txt (key=value, values in seconds).
+   Outputs milliseconds; 0 means "never / disabled".
+   Falls back to 5 min screen timeout and suspend disabled. */
+static void load_minui_settings(uint32_t *screen_ms, uint32_t *suspend_ms) {
+    *screen_ms  = 300000;   /* 5 min fallback */
+    *suspend_ms = 0;        /* suspend disabled by default */
+
+    const char *base = getenv("SHARED_USERDATA_PATH");
+    if (!base || !base[0]) base = "/mnt/SDCARD/.userdata/shared";
+    char path[300];
+    snprintf(path, sizeof(path), "%s/minuisettings.txt", base);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char key[64]; int val;
+    while (fscanf(f, " %63[^=]=%d", key, &val) == 2) {
+        if (strcmp(key, "screentimeout") == 0)
+            *screen_ms  = (val <= 0) ? 0 : (uint32_t)val * 1000;
+        else if (strcmp(key, "suspendTimeout") == 0)
+            *suspend_ms = (val <= 0) ? 0 : (uint32_t)val * 1000;
     }
-    return 300000;   /* 5 min fallback */
+    fclose(f);
 }
 
 // ----------------------------------------------------------------
@@ -986,7 +1025,12 @@ int main(void) {
     };
     if (ap_init(&cfg) != AP_OK) return 1;
     ap_set_power_handler(false);   /* we manage the power button ourselves in screen.c */
-    screen_set_timeout(load_nextui_timeout());
+    {
+        uint32_t screen_ms, suspend_ms;
+        load_minui_settings(&screen_ms, &suspend_ms);
+        screen_set_timeout(screen_ms);
+        g_suspend_timeout_ms = suspend_ms;
+    }
     screen_init();
     screen_init_power();
 
