@@ -40,8 +40,8 @@ linux:
 tg5040:
 	@mkdir -p '$(TMP_PAK)'
 	$(DOCKER) run --rm \
-		-v "$(CURDIR)":/workspace \
-		-v "$(shell realpath $(APOSTROPHE))":/workspace/apostrophe \
+		-v "$(CURDIR)":/workspace:z \
+		-v "$(shell realpath $(APOSTROPHE))":/workspace/apostrophe:z \
 		$(TG5040_TOOLCHAIN) \
 		make -C /workspace -f ports/tg5040/Makefile \
 			BUILD_DIR=/workspace/$(TMP_PAK)

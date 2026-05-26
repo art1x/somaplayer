@@ -545,11 +545,12 @@ static void render_main(void) {
             SomaChannel *ch      = &g_channels.channels[ch_i];
             bool         sel     = (ch_i == g_cursor);
             bool         playing = (ch_i == g_playing_idx);
-            /* Show the grey highlight pill on the last-played station even when
-               stopped – gives visual continuity. LIVE badge still only appears
-               when actually streaming (playing == true). */
+            /* Show the grey highlight pill on the last-played station when stopped
+               (paused indicator). Only when nothing is playing – once a new
+               station starts the old paused highlight must disappear. */
             bool         paused  = (!playing && ch_i == g_last_played_idx
-                                    && g_last_played_idx >= 0);
+                                    && g_last_played_idx >= 0
+                                    && g_playing_idx < 0);
             bool         fav     = favorites_contains(&g_favorites, ch->id);
 
             int iy = cont_top + i * item_h;
