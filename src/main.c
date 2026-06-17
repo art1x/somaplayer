@@ -665,13 +665,23 @@ static void render_main(void) {
                 ap_draw_rounded_rect(tx - pad, ty - pad / 2, text_w + 2 * pad, pill_h, pill_r, np_bg);
                 ap_draw_text(fxsm, np_buf, tx, ty, np_fg);
             } else {
+                /* Apostrophe's ap_present() idles via SDL_WaitEventTimeout
+                   when no frame is requested, to save power — it only
+                   wakes on input or ~1s ticks. Without this, the ticker
+                   would advance in one big jump per wake instead of
+                   scrolling continuously. Schedule a wake every ~33ms
+                   (30fps) instead of forcing full 60fps — still smooth
+                   at this scroll speed (~3px/frame) but roughly halves
+                   the redraw load while the marquee is active. */
+                ap_request_frame_in(33);
+
                 if (strcmp(np_buf, g_ticker_last) != 0) {
                     strncpy(g_ticker_last, np_buf, sizeof(g_ticker_last) - 1);
                     g_ticker_px = 0;
                     g_ticker_ms = 0;
                 }
                 if (g_ticker_ms > 2000)
-                    g_ticker_px = (int)((g_ticker_ms - 2000) * 60 / 1000);
+                    g_ticker_px = (int)((g_ticker_ms - 2000) * 90 / 1000);
 
                 ap_draw_rounded_rect(tx - pad, ty - pad / 2, pill_maxw + 2 * pad, pill_h, pill_r, np_bg);
 
@@ -866,19 +876,27 @@ static void screen_main(void) {
                     g_desc_hide_at = SDL_GetTicks() + 10000;
                     break;
 
-                case AP_BTN_LEFT:
-                    /* Previous station with wrap, and play it immediately */
-                    g_cursor = (g_cursor > 0) ? g_cursor - 1 : g_channels.count - 1;
+                case AP_BTN_LEFT: {
+                    /* Previous station with wrap, relative to what's actually
+                       playing (not wherever the list cursor happens to be) —
+                       so repeated LEFT/RIGHT presses step through stations in
+                       order even if the user scrolled the list in between. */
+                    int base = (g_playing_idx >= 0) ? g_playing_idx : g_cursor;
+                    g_cursor = (base > 0) ? base - 1 : g_channels.count - 1;
                     g_desc_hide_at = SDL_GetTicks() + 10000;
                     if (play_channel(g_cursor)) load_cover(g_cursor);
                     break;
+                }
 
-                case AP_BTN_RIGHT:
-                    /* Next station with wrap, and play it immediately */
-                    g_cursor = (g_cursor < g_channels.count - 1) ? g_cursor + 1 : 0;
+                case AP_BTN_RIGHT: {
+                    /* Next station with wrap, relative to what's actually
+                       playing — see AP_BTN_LEFT comment above. */
+                    int base = (g_playing_idx >= 0) ? g_playing_idx : g_cursor;
+                    g_cursor = (base < g_channels.count - 1) ? base + 1 : 0;
                     g_desc_hide_at = SDL_GetTicks() + 10000;
                     if (play_channel(g_cursor)) load_cover(g_cursor);
                     break;
+                }
 
                 case AP_BTN_A:
                     /* A always plays / switches to the highlighted station */
