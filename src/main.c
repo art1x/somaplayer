@@ -777,6 +777,11 @@ static void screen_main(void) {
         screen_update(elapsed);
         last_ticks = now_ticks;
 
+        /* ── Audio sink hotplug ──────────────────────────────────── */
+        /* USB-C interface / Bluetooth speaker plugged in or removed —
+         * rejoin the stream so mpg123 picks up the new device. */
+        player_check_audio_sink();
+
         /* ── Ticker time ─────────────────────────────────────────── */
         if (!screen_is_off()) g_ticker_ms += elapsed;
 
